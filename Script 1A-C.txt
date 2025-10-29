@@ -1,0 +1,1481 @@
+/***************************************************************
+ * FINANCEIRO FAMILIAR — (versão enxuta, consolidada)
+ * Entrega: 1A (Core & Caches) + 1B (Listas, Cartões, DVs) + 1C (IDs/Status/Competências/Fechamento/Resumos/onEdit)
+ * Notas rápidas:
+ * - Centavos-first: use _partsCents_/_sumCents_ para qualquer cálculo com parcelas.
+ * - EPS_CENT=0.005 reduz falso-positivo de arredondamento.
+ * - CACHE_TTL=1800 diminui I/O em planilhas grandes.
+ ***************************************************************/
+
+/* ===================== [1A] Core & Caches ===================== */
+
+/** Script properties */
+function getCfg_(key, defv){ const p=PropertiesService.getScriptProperties(); const v=p.getProperty(key); return v!=null?v:defv; }
+
+/** Ambiente (DEV/PROD, opcional) */
+function env_(){ const e=(getCfg_('ENV','PROD')+'').toUpperCase(); return { DEV:e==='DEV', PROD:e!=='DEV' }; }
+
+/** Spreadsheet alvo (por ID ou ativo) */
+function SS_(){ const id=getCfg_('KEY_SPREADSHEET_ID',null); return id?SpreadsheetApp.openById(id):SpreadsheetApp.getActive(); }
+/** ID “seguro” para cache/log/headless */
+function _docIdSafe_(){ try{ const ss=SS_(); return ss && ss.getId ? ss.getId() : 'global'; }catch(_){ return 'global'; } }
+
+/** Timezone + formatação (cache por planilha alvo) */
+const __tz_cache__ = {};
+function _tz_(){
+  let ss;
+  try { ss = SS_(); } catch(_) { ss = null; }
+  const key = ss && ss.getId ? ss.getId() : 'global';
+  if (__tz_cache__[key]) return __tz_cache__[key];
+  let tz;
+  try{
+    tz = ss ? ss.getSpreadsheetTimeZone()
+            : SpreadsheetApp.getActive().getSpreadsheetTimeZone();
+  }catch(_){
+    tz = (Session.getScriptTimeZone && Session.getScriptTimeZone()) || 'America/Araguaina';
+  }
+  __tz_cache__[key] = tz || 'America/Araguaina';
+  return __tz_cache__[key];
+}
+function formatDate_(d, fmt){ return Utilities.formatDate(new Date(d), _tz_(), fmt||'yyyy-MM-dd'); }
+
+/** Moeda ⇄ centavos (robusto) */
+function toCents_(v){
+  if (v==null||v==='') return 0;
+  if (typeof v==='number'){
+    if(!isFinite(v)) throw new Error('Valor inválido: '+v);
+    const s = /e/i.test(String(v)) ? v.toFixed(20) : String(v); // “achata” expoente
+    return toCents_(s);
+  }
+
+  let s = String(v)
+    .replace(/\u00A0/g,' ')       // NBSP → espaço normal
+    .replace(/[−–—]/g,'-')        // en/em-dash → hífen
+    .trim()
+    .replace(/[R$\u20A8\u20AC\u00A3]/gi,'') // símbolos de moeda
+    .replace(/\s+/g,'');          // remove espaços
+
+  // Sinal (parênteses ou qualquer hífen, em qualquer posição)
+  let negative = false;
+  if (/\(.*\)/.test(s)) { negative = true; s = s.replace(/[()]/g,''); }
+  if (/-/.test(s))      { negative = true; s = s.replace(/-+/g,''); }
+
+  if (s==='' || s==='.' || s===',') return 0;
+
+  // completa formatos “incompletos”
+  if (/^[.,]/.test(s)) s = '0'+s;   // ".50" → "0.50", ",5" → "0,5"
+  if (/[.,]$/.test(s)) s += '0';    // "1," → "1,0"
+
+  // decide papéis de . e ,
+  if (s.indexOf(',')>=0 && s.indexOf('.')>=0){
+    // BR: ponto de milhar + vírgula decimal
+    s = s.replace(/\.(?=\d{3}(\D|$))/g,'').replace(',', '.');
+  } else if (s.indexOf(',')>=0){
+    s = s.replace(',', '.');                 // só vírgula → decimal
+  } else if (s.indexOf('.')>=0){
+    // Só ponto: tratar como milhar APENAS se a parte antes do 1º ponto não for "0"
+    const parts = s.split('.');
+    const looksLikeThousands =
+      parts.length > 1 &&
+      parts[0] !== '0' &&
+      /^\d{1,3}$/.test(parts[0]) &&
+      parts.slice(1).every(seg => /^\d{3}$/.test(seg));
+    if (looksLikeThousands){
+      s = parts.join(''); // remove pontos de milhar
+    }
+    // senão, é decimal EN (mantém o ponto)
+  }
+
+  const m = s.match(/^(\d+)(?:\.(\d+))?$/);
+  if(!m) throw new Error('Valor inválido: '+v);
+
+  const intP = parseInt(m[1]||'0',10);
+  const frac = m[2]||'';
+  const d1 = frac[0] ? +frac[0] : 0;
+  const d2 = frac[1] ? +frac[1] : 0;
+  const d3 = frac[2] ? +frac[2] : 0; // arredonda na 3ª casa
+  const cents = intP*100 + d1*10 + d2 + (d3>=5 ? 1 : 0);
+
+  return (negative ? -1 : 1) * cents;
+}
+
+function fromCents_(c){ return (c||0)/100; }
+function fmtBRL_(n){
+  let x=(typeof n==='string')?Number(n.replace(',','.')):Number(n);
+  if (!isFinite(x)) x = 0;
+  if (Object.is(x,-0) || Math.abs(x) < 0.0005) x = 0; // anti -0,00
+  try{ return new Intl.NumberFormat('pt-BR',{style:'currency',currency:'BRL'}).format(x); }
+  catch(_){ return 'R$ '+x.toFixed(2); }
+}
+
+/** LOG leve (aba LOGS) */
+function _ensureLogsSheet_(){ const ss=SS_(); let sh=ss.getSheetByName('LOGS'); if(!sh) sh=ss.insertSheet('LOGS'); if(sh.getLastRow()<1) sh.appendRow(['Quando','Nível','ms','Obs']); return sh; }
+function _log_(level, scope, msOrObj, obs){ try{ const sh=_ensureLogsSheet_(); const ms=(typeof msOrObj==='number')?msOrObj:''; const extra=(typeof msOrObj==='object'&&msOrObj)?' | '+JSON.stringify(msOrObj):''; sh.appendRow([new Date(),String(level||''),ms,`${scope||''}${obs?(' — '+obs):''}${extra}`]); }catch(_){ } }
+const LOG_={ enabled:true, info:(...x)=>(LOG_.enabled&&Logger.log('[INFO] '+x.join(' '))), warn:(...x)=>(LOG_.enabled&&Logger.log('[WARN] '+x.join(' '))), error:(...x)=>(LOG_.enabled&&Logger.log('[ERROR] '+x.join(' '))) };
+
+/** Ranges & header */
+function effectiveRange_(sh, headerRows){ const hr=headerRows||1; const lr=Math.max(sh.getLastRow()-hr,0); const lc=sh.getLastColumn(); if(lr<=0||lc<=0) return null; return sh.getRange(hr+1,1,lr,lc); }
+function headerMap_(sh, headerRow){ const r=sh.getRange(headerRow||1,1,1,sh.getLastColumn()); const names=r.getValues()[0].map(s=>(s||'').toString().trim()); const map={}; names.forEach((name,i)=>{ if(name) map[name]=i+1; }); return map; }
+
+/** Lean mode (sem throttles) */
+function lean_(){ return String(getCfg_('LEAN_MODE','true')).toLowerCase()==='true'; }
+
+/** Flags & limiares */
+const FEATURES={ NO_PROTECT:false, NO_COND_FORMAT:false };
+const SAFETY  ={ MAX_PASTE_ROWS:2000, MAX_PASTE_COLS:20 };
+const EPS_CENT=0.005;
+const UTIL_THRESH={ WARN:0.30, ALERT:0.40 };
+const ORC_ALERTS={ WARN_PCT:0.80, ALERT_PCT:1.00 };
+
+/** Abas / Colunas */
+const ABAS={ CONFIGURACOES:'Configurações', RECEITA:'Receita', DESPESAS_FIXAS_PREVISOES:'Despesas Fixas e Previsões', LANCAMENTO_DESPESA:'Lançamento de Despesa', PREVISAO_GASTOS:'Previsão de Gastos', CALENDARIO_FINANCEIRO:'Calendário Financeiro', RESUMO_ANUAL:'Resumo Anual', INDICADORES:'Indicadores', FATURAS_CARTAO:'Faturas de Cartão', RESUMO_FATURAS:'Resumo de Faturas', PARCELAS_CARTAO:'Parcelas do Cartão', JANEIRO:'Janeiro', FEVEREIRO:'Fevereiro', MARCO:'Março', ABRIL:'Abril', MAIO:'Maio', JUNHO:'Junho', JULHO:'Julho', AGOSTO:'Agosto', SETEMBRO:'Setembro', OUTUBRO:'Outubro', NOVEMBRO:'Novembro', DEZEMBRO:'Dezembro' };
+const MESES=[ABAS.JANEIRO,ABAS.FEVEREIRO,ABAS.MARCO,ABAS.ABRIL,ABAS.MAIO,ABAS.JUNHO,ABAS.JULHO,ABAS.AGOSTO,ABAS.SETEMBRO,ABAS.OUTUBRO,ABAS.NOVEMBRO,ABAS.DEZEMBRO];
+const COL={ DATA:2, SUBCATEGORIA:3, DETALHAMENTO:4, CATEGORIA:5, FORMA:6, PARCELAS:7, VALOR:8, VALOR_PARCELADO:9, STATUS:10, COMPETENCIA:11, CENTRO_CUSTO:12, TIPO:13, LIQUIDACAO:14, ID_EXTRATO:15 };
+const COL2={ COMP_CONSUMO:16 };      // P
+const COL_FP=17;                      // Q
+const CARTOES_HEADER_ROW=17, CARTOES_FIRST_ROW=18, CARTOES_FIRST_COL=8, CARTOES_LAST_COL=13;
+const LIMITE_LINHAS=9999;
+
+/** Polyfill */
+if (!Array.prototype.flat) Object.defineProperty(Array.prototype,'flat',{ value:function(d=1){ return this.reduce((a,v)=>a.concat(Array.isArray(v)?v.flat(d-1):v),[]); }});
+
+/** Utils diversos */
+function _stripDiacritics_(s){ try{ return String(s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,''); }catch(_){ return String(s||''); } }
+function _normLower_(s){ return _stripDiacritics_(s).toLowerCase().trim(); }
+function getSheetSmart_(preferido, alternates){
+  const ss=SS_(); let sh=ss.getSheetByName(preferido); if(sh) return sh;
+  for(const nm of (alternates||[])){ sh=ss.getSheetByName(nm); if(sh) return sh; }
+  const alvo=_normLower_(preferido);
+  for(const s of ss.getSheets()){ if(_normLower_(s.getName())===alvo) return s; }
+  for(const s of ss.getSheets()){ if(_normLower_(s.getName()).indexOf(alvo)>=0) return s; }
+  return null;
+}
+function _getCfg_(){ return getSheetSmart_(ABAS.CONFIGURACOES,['Configuracoes']); }
+function _getLanc_(){ return getSheetSmart_(ABAS.LANCAMENTO_DESPESA,['Lancamento de Despesa']); }
+function _norm(s){ try{ return String(s||'').toLowerCase().trim(); }catch(_){ return String(s||''); } }
+function _fmtDate_(d, fmt='dd/MM/yyyy'){ return Utilities.formatDate(d, _tz_(), fmt); }
+function _today_(){ const n=new Date(); return new Date(n.getFullYear(), n.getMonth(), n.getDate()); }
+function _dateOnly_(d){ if(!(d instanceof Date)||isNaN(d)) return null; return new Date(d.getFullYear(), d.getMonth(), d.getDate()); }
+function _escRegex_(s){ return String(s||'').replace(/[.*+?^${}()|[\]\\]/g,'\\$&'); }
+function _sanitizaDia_(v){ v=Number(v); return (v>=1&&v<=31)?v:null; }
+function _isConciliadoStatus_(s){ return /\b(conciliad|pago|quitad|liquidad|baixad|compensad|ok)\b/i.test(String(s||'')); }
+function _maybeToast_(msg){
+  try{ SS_().toast(String(msg||'')); }
+  catch(_){ try{ SpreadsheetApp.getActive().toast(String(msg||'')); }catch(__){ try{ Logger.log('[toast] '+msg); }catch(___){} } }
+}
+function _sameDate_(a,b){ const da=(a instanceof Date&&!isNaN(a))?a:null; const db=(b instanceof Date&&!isNaN(b))?b:null; if(da&&db) return da.getTime()===db.getTime(); return String(a||'')===String(b||''); }
+
+/** Parse datas BR/ISO (estritas) */
+function parseDateBR_(v){
+  if(v instanceof Date && !isNaN(v)) return _dateOnly_(v);
+  if(typeof v==='string'){
+    const s=v.trim();
+    let m=s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/); // yyyy-mm-dd
+    if(m){ const yyyy=+m[1], mm=+m[2], dd=+m[3]; const d=new Date(yyyy,mm-1,dd); if(d.getFullYear()===yyyy&&d.getMonth()===mm-1&&d.getDate()===dd) return _dateOnly_(d); return null; }
+    m=s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);   // dd/mm/yy(yy)
+    if(m){ let dd=+m[1], mm=+m[2], yyyy=+m[3]; if(yyyy<100) yyyy+=(yyyy>=70?1900:2000); const d=new Date(yyyy,mm-1,dd); if(d.getFullYear()===yyyy&&d.getMonth()===mm-1&&d.getDate()===dd) return _dateOnly_(d); return null; }
+  }
+  return null;
+}
+
+/** Params/flags via Script Properties */
+function param_(key, defv){ const v=getCfg_(key,null); return v!=null?v:defv; }
+function features_(){
+  const noFmtProp=param_('NO_COND_FORMAT',null); const noFmt=(noFmtProp!=null?(''+noFmtProp).toLowerCase()==='true':!!FEATURES.NO_COND_FORMAT);
+  const noProtProp=param_('NO_PROTECT',null);     const noProt=(noProtProp!=null?(''+noProtProp).toLowerCase()==='true':!!FEATURES.NO_PROTECT);
+  return { NO_COND_FORMAT:noFmt, NO_PROTECT:noProt };
+}
+function utilThresholds_(){ const t1=parseFloat(param_('UTIL_T1',UTIL_THRESH.WARN)); const t2=parseFloat(param_('UTIL_T2',UTIL_THRESH.ALERT)); return { WARN:t1, ALERT:t2 }; }
+
+/** === DV helpers (só regrava quando muda) === */
+function _dvSigList_(lista){ return 'LIST|'+(lista||[]).map(String).join('\u0001'); }
+function _dvSigRule_(rule){
+  try{
+    if(!rule) return '';
+    const crit=rule.getCriteriaType&&rule.getCriteriaType();
+    const args=rule.getCriteriaValues&&rule.getCriteriaValues();
+    if(crit===SpreadsheetApp.DataValidationCriteria.VALUE_IN_LIST){ const arr=(args&&args[0])?args[0]:[]; return _dvSigList_(arr); }
+    if(crit===SpreadsheetApp.DataValidationCriteria.VALUE_IN_RANGE){ const rng=(args&&args[0])?args[0]:null; if(rng) return 'RANGE|'+rng.getSheet().getSheetId()+'!'+rng.getA1Notation(); }
+  }catch(_){}
+  return '';
+}
+function _applyDVIfChanged_(range, lista, allowInvalid){
+  if(!lista||!lista.length){ range.clearDataValidations(); return; }
+  const wantSig=_dvSigList_(lista); let allSame=true; const existing=range.getDataValidations();
+  for(let r=0; allSame && r<existing.length; r++){ const row=existing[r]; for(let c=0;c<row.length;c++){ if(_dvSigRule_(row[c])!==wantSig){ allSame=false; break; } } }
+  if(allSame) return;
+  const rule=SpreadsheetApp.newDataValidation().requireValueInList(lista,true).setAllowInvalid(!!allowInvalid).build();
+  range.setDataValidation(rule);
+}
+function _applyDVRangeIfChanged_(range, targetRange, allowInvalid){
+  if(!range||!targetRange){ try{ range && range.clearDataValidations(); }catch(_){ } return; }
+  const wantSig='RANGE|'+targetRange.getSheet().getSheetId()+'!'+targetRange.getA1Notation();
+  const existing=range.getDataValidations(); let allSame=existing&&existing.length>0;
+  outer: for(let r=0; r<(existing?existing.length:0); r++){ const row=existing[r]||[]; for(let c=0;c<row.length;c++){ if(_dvSigRule_(row[c])!==wantSig){ allSame=false; break outer; } } }
+  if(allSame) return;
+  const rule=SpreadsheetApp.newDataValidation().requireValueInRange(targetRange,true).setAllowInvalid(!!allowInvalid).build();
+  range.setDataValidation(rule);
+}
+
+/** === Cache leve (Config/Listas/Cartões) === */
+const CACHE_TTL = 1800;   // 30 min
+const SCRIPT_TTL= 21600;  // 6 h
+function _cfgCacheKey_(s){ return 'cfg_cache_'+s; }
+let _cardsMatchCache=null;
+
+function _invalidateCfgCaches_(){
+  const dc=CacheService.getDocumentCache();
+  ['lists_v3','cards_v3','cfg_map_v2'].forEach(s=>{ try{ dc.remove(_cfgCacheKey_(s)); }catch(_){} });
+  try{ const sc=CacheService.getScriptCache(); const ssId=_docIdSafe_(); ['lists_v3','cards_v3'].forEach(k=>sc.remove(ssId+'::'+k)); }catch(_){}
+  _cardsMatchCache=null;
+}
+function _scGet_(k){ try{ return CacheService.getScriptCache().get(k); }catch(_){ return null; } }
+function _scPut_(k,v,ttl){ try{ CacheService.getScriptCache().put(k,v,ttl); }catch(_){ } }
+function ensureCfgCachesWarm_(cfgOpt){
+  const ssId=_docIdSafe_(); const k1=ssId+'::lists_v3', k2=ssId+'::cards_v3';
+  if(!_scGet_(k1)) try{ getCfgCached_(cfgOpt||_getCfg_(),true); }catch(_){}
+  if(!_scGet_(k2)) try{ getCartoesCached_(cfgOpt||_getCfg_(),true); }catch(_){}
+}
+
+/** Centavos-first helpers (para 1B/1C usarem) */
+function _partsCents_(valorTotalRaw, n, valorParcelaRaw){
+  n = Math.max(1, parseInt(n,10) || 1);
+  const totalCents = toCents_(valorTotalRaw);
+
+  if (totalCents !== 0){
+    const sign = totalCents < 0 ? -1 : 1;
+    const abs  = Math.abs(totalCents);
+    const base = Math.floor(abs / n), rest = abs - base*n;
+    return Array.from({length:n}, (_, i) => sign * (base + (i < rest ? 1 : 0)));
+  }
+
+  const parc = toCents_(valorParcelaRaw);
+  if (parc !== 0) return Array.from({length:n}, () => parc);
+  return Array(n).fill(0);
+}
+function _sumCents_(arr){ return (arr||[]).reduce((a,b)=>a+(Number(b)||0),0); }
+
+/** Auto-detecção de campos na aba de Config */
+function _findLabelCell_(cfg, labels, searchCols, scanRows){
+  const maxRows=Math.min(scanRows||50,cfg.getMaxRows()); const cols=searchCols&&searchCols.length?searchCols:[8,9,10]; const wanted=labels.map(_norm);
+  for(const c of cols){ const vals=cfg.getRange(1,c,maxRows,1).getValues().flat(); for(let r=0;r<vals.length;r++){ const s=_norm(vals[r]); if(!s) continue; if(wanted.some(w=>s.includes(w))) return cfg.getRange(r+1,c); } }
+  return null;
+}
+function _rightValueCell_(labelCell){
+  if(!labelCell) return null; const sh=labelCell.getSheet(), row=labelCell.getRow(), lastCol=sh.getLastColumn();
+  for(let c=labelCell.getColumn()+1; c<=Math.min(lastCol,labelCell.getColumn()+4); c++){ const cell=sh.getRange(row,c), v=cell.getValue(); if(!(v===""||v===null)) return cell; }
+  return sh.getRange(row, Math.min(lastCol,labelCell.getColumn()+1));
+}
+function _cfgMap_(cfgIn){
+  const cfg=cfgIn||_getCfg_(); if(!cfg) return { ANOREF_CELL:'I14', COMP_MODE_CELL:'I15', CARTOES_HEADER_ROW, CARTOES_FIRST_ROW, CARTOES_FIRST_COL, CARTOES_LAST_COL };
+  const cache=CacheService.getDocumentCache(); const key=_cfgCacheKey_('cfg_map_v2'); const c=cache.get(key); if(c){ try{ return JSON.parse(c); }catch(_){ } }
+  const lblAno=_findLabelCell_(cfg,['anoref','ano de referencia','ano de referência'],[8,9],60);
+  const lblModo=_findLabelCell_(cfg,['modo','competencia','competência','caixa','consumo'],[8,9],60);
+  const anoCell=_rightValueCell_(lblAno), modoCell=_rightValueCell_(lblModo);
+  const map={ ANOREF_CELL: anoCell?anoCell.getA1Notation():'I14', COMP_MODE_CELL: modoCell?modoCell.getA1Notation():'I15', CARTOES_HEADER_ROW, CARTOES_FIRST_ROW, CARTOES_FIRST_COL, CARTOES_LAST_COL };
+  try{ cache.put(key, JSON.stringify(map), CACHE_TTL); }catch(_){ }
+  return map;
+}
+function _isEditedCell_(sheet,row,col,a1,editedRangeOpt){
+  if(!a1) return false;
+  const t=sheet.getRange(a1), r=editedRangeOpt||sheet.getRange(row,col,1,1);
+  const r1=r.getRow(), c1=r.getColumn(), r2=r1+r.getNumRows()-1, c2=c1+r.getNumColumns()-1;
+  const tr=t.getRow(), tc=t.getColumn(), tr2=tr+t.getNumRows()-1, tc2=tc+t.getNumColumns()-1;
+  return !(r2<tr || r1>tr2 || c2<tc || c1>tc2);
+}
+
+/** Listas/Dados da aba Config (cacheados) */
+function _cfgLastRow_(cfg){ const last=cfg.getLastRow(); const vals=last>2?cfg.getRange(3,2,Math.max(0,last-2),1).getValues().flat():[]; let end=vals.length; while(end>0&&String(vals[end-1]||'').trim()==='') end--; return Math.max(3,end+2); }
+function _rng(cfg,c1,r0){ const last=_cfgLastRow_(cfg); return cfg.getRange(r0,c1,last-r0+1,1); }
+
+function getCfgCached_(cfgIn, force){
+  const cfg=cfgIn||_getCfg_(); if(!cfg) return { subs:[], cats:[], dets:[], subToCat:{}, catToSubs:{} };
+  const dc=CacheService.getDocumentCache(); const ssId=_docIdSafe_(); const scKey=ssId+'::lists_v3';
+  const dcKey=_cfgCacheKey_('lists_v3');
+  if(!force){
+    const sc=_scGet_(scKey); if(sc){ try{ return JSON.parse(sc); }catch(_){ } }
+    const c=dc.get(dcKey); if(c){ try{ return JSON.parse(c); }catch(_){ } }
+  }
+  const last=_cfgLastRow_(cfg);
+  const subs=_rng(cfg,2,3).getValues().slice(0,last-2).flat().filter(String);
+  const cats=_rng(cfg,3,3).getValues().slice(0,last-2).flat().filter(String);
+  const dets=_rng(cfg,5,3).getValues().slice(0,last-2).flat().filter(String);
+  const subToCat={}; subs.forEach((s,i)=>{ const c=cats[i]; if(s&&c) subToCat[s]=c; });
+  const catToSubs={}; subs.forEach((s,i)=>{ const c=cats[i]; if(c) (catToSubs[c]=(catToSubs[c]||[])).push(s); });
+  const payload={ subs, cats, dets, subToCat, catToSubs };
+  try{ dc.put(dcKey, JSON.stringify(payload), CACHE_TTL); }catch(_){ }
+  _scPut_(scKey, JSON.stringify(payload), SCRIPT_TTL);
+  return payload;
+}
+
+/** Leitura da tabela de cartões (H..M por padrão) */
+function _rangeCartoes_(cfgIn){
+  const cfg=cfgIn||_getCfg_(); if(!cfg) return [];
+  const map=_cfgMap_(cfg); const sh=cfg; const lastRow=sh.getLastRow();
+  if(lastRow<map.CARTOES_FIRST_ROW) return [];
+  const nomes=sh.getRange(map.CARTOES_FIRST_ROW, map.CARTOES_FIRST_COL, lastRow-map.CARTOES_FIRST_ROW+1,1).getValues().flat();
+  let endRow=map.CARTOES_FIRST_ROW-1;
+  for(let i=0;i<nomes.length;i++){ const has=String(nomes[i]||'').trim()!==''; if(has) endRow=map.CARTOES_FIRST_ROW+i; }
+  if(endRow<map.CARTOES_FIRST_ROW) return [];
+  const numRows=endRow-map.CARTOES_FIRST_ROW+1;
+  return sh.getRange(map.CARTOES_FIRST_ROW, map.CARTOES_FIRST_COL, numRows, map.CARTOES_LAST_COL-map.CARTOES_FIRST_COL+1).getValues()
+    .filter(r=>String(r[0]||'').trim()!=='')
+    .sort((a,b)=> String(b[0]||'').length - String(a[0]||'').length);
+}
+
+/** Cache leve para cartões (simétrico ao de listas) */
+/** Cache leve para cartões (simétrico ao de listas) */
+function getCartoesCached_(cfgIn, force){
+  const cfg = cfgIn || _getCfg_(); 
+  if (!cfg) return [];
+
+  const dc   = CacheService.getDocumentCache();
+  const ssId = _docIdSafe_();
+
+  const scKey = ssId + '::cards_v3';
+  const dcKey = _cfgCacheKey_('cards_v3');
+
+  if (!force){
+    const sc = _scGet_(scKey);
+    if (sc){
+      try { return JSON.parse(sc); } catch(_) { /* ignora cache corrompido */ }
+    }
+    const c = dc.get(dcKey);
+    if (c){
+      try { return JSON.parse(c); } catch(_) { /* ignora cache corrompido */ }
+    }
+  }
+
+  const rows = _rangeCartoes_(cfg) || [];
+
+  try { dc.put(dcKey, JSON.stringify(rows), CACHE_TTL); } catch(_){ /* sem stress */ }
+  _scPut_(scKey, JSON.stringify(rows), SCRIPT_TTL);
+
+  return rows;
+}
+
+/* ===================== [1B] Listas, Cartões, DVs & Ciclo ===================== */
+
+/** EXACT/LOOSE para casar “Forma” com cartões */
+function _cardsMatchMode_(){ const m=String(getCfg_('CARD_MATCH','LOOSE')||'').toUpperCase().trim(); return (m==='EXACT')?'EXACT':'LOOSE'; }
+
+/** Compilação de regex p/ cartões (cacheada) — usa cache de cartões */
+function _getCardsMatchers_(cfg){
+  const c=cfg||_getCfg_(); const key=(c&&c.getSheetId?c.getSheetId():'default')+'::'+_cardsMatchMode_();
+  if(_cardsMatchCache && _cardsMatchCache.key===key) return _cardsMatchCache.list;
+  const rows=getCartoesCached_(c,false)||[]; // ← cache
+  const mode=_cardsMatchMode_();
+  const list=rows.filter(r=>String(r[0]||'').trim()).map(r=>{
+    const nomeNorm=_stripDiacritics_(String(r[0]||'')).toLowerCase().trim();
+    const esc=_escRegex_(nomeNorm);
+    const re=(mode==='EXACT')? new RegExp(`^${esc}$`,'i') : new RegExp(`(?:^|[\\s\\-_/.,;()])${esc}(?:[\\s\\-_/.,;()]|$)`,'i');
+    return { row:r, re };
+  });
+  _cardsMatchCache={ key, list };
+  return list;
+}
+function ehCartao_(forma){ const f=_stripDiacritics_(String(forma||'')).toLowerCase().trim(); if(!f) return false; return _getCardsMatchers_(_getCfg_()).some(x=>x.re.test(f)); }
+function _findCartaoRow_(forma){ const f=_stripDiacritics_(String(forma||'')).toLowerCase().trim(); if(!f) return null; const hit=_getCardsMatchers_(_getCfg_()).find(x=>x.re.test(f)); return hit?hit.row:null; }
+
+/** Ciclo de cartão: devolve mês/ano da fatura e datas-chave */
+function calcularCicloCartao(dataCompra, ini, fim, venc){
+  ini=Number(ini); fim=Number(fim); venc=Number(venc);
+  if(!(ini>=1&&ini<=31)||!(fim>=1&&fim<=31)||!(venc>=1&&venc<=31)){ const d=new Date(dataCompra); return { ano:d.getFullYear(), mes:d.getMonth()+1, primeiroDia:new Date(d.getFullYear(), d.getMonth(), 1) }; }
+  function atMidday_(d){ const x=new Date(d); x.setHours(12,0,0,0); return x; }
+  function safeDate_(y,m,d){ const max=new Date(y,m+1,0).getDate(); const dt=new Date(y,m,Math.min(d,max)); dt.setHours(12,0,0,0); return dt; }
+  const p=atMidday_(dataCompra); const pDay=p.getDate();
+  let closeMonthOffset; if(ini<=fim){ closeMonthOffset=(pDay>=fim)?1:0; } else { closeMonthOffset=(pDay>=ini)?1:0; if(pDay===fim) closeMonthOffset=1; }
+  const closeBase=new Date(p.getFullYear(), p.getMonth()+closeMonthOffset,1);
+  const dueMonthOffset=(venc>fim)?0:1; const dueFirstDay=new Date(closeBase.getFullYear(), closeBase.getMonth()+dueMonthOffset,1);
+  const inicio=safeDate_(closeBase.getFullYear(), closeBase.getMonth() - (ini<=fim?0:1), ini);
+  const fimDate=safeDate_(closeBase.getFullYear(), closeBase.getMonth(), fim);
+  const vencDate=safeDate_(dueFirstDay.getFullYear(), dueFirstDay.getMonth(), venc);
+  return { ano:dueFirstDay.getFullYear(), mes:dueFirstDay.getMonth()+1, primeiroDia:dueFirstDay, inicio, fim:fimDate, venc:vencDate };
+}
+
+/** Listas/DV (Categorias, Sub, Formas) */
+function listaCategorias_(cfgIn){ const cfg=cfgIn||_getCfg_(); if(!cfg) return []; const last=_cfgLastRow_(cfg); return [...new Set(cfg.getRange(3,3,last-2,1).getValues().flat().filter(String))]; }
+function listaSubcategorias_(cfgIn){ const cfg=cfgIn||_getCfg_(); if(!cfg) return []; const last=_cfgLastRow_(cfg); return cfg.getRange(3,2,last-2,1).getValues().flat().filter(String); }
+function _cartaoTemCicloValido_(row){ const venc=_sanitizaDia_(row[1]), ini=_sanitizaDia_(row[2]), fim=_sanitizaDia_(row[3]); return !(venc==null||ini==null||fim==null); }
+
+function listaFormasComCartoes_(cfgIn){
+  const cfg=cfgIn||_getCfg_(); if(!cfg) return [];
+  const vals=cfg.getRange(3,8,9,1).getValues().flat(); // H3:H11 (formas fixas)
+  const fixas=vals.map(v=>String(v||'').trim()).filter(Boolean);
+  // Inclui todos os cartões (com ou sem ciclo); os sem ciclo serão tratados como “não-cartão” até configurar
+  const cartoes=getCartoesCached_(cfg,false)
+    /* .filter(_cartaoTemCicloValido_) */  // opcionalmente reativar se quiser esconder cartões sem ciclo
+    .map(r=>String(r[0]||'').trim())
+    .filter(Boolean);
+  const seen=new Set(), out=[]; [...fixas,...cartoes].forEach(v=>{ const k=_normLower_(v); if(k && !seen.has(k)){ seen.add(k); out.push(v.trim()); } });
+  return out;
+}
+function atualizarMenuCategoriasLancamento(shIn, categorias){
+  const sh=shIn||_getLanc_(); if(!sh) return; const firstRow=4;
+  const lastUsed=Math.max(firstRow, sh.getLastRow()); const buffer=400;
+  const totalRows=Math.min(LIMITE_LINHAS, (lastUsed-firstRow+1)+buffer); if(totalRows<=0) return;
+  _applyDVIfChanged_(sh.getRange(firstRow, COL.CATEGORIA, totalRows,1), categorias, false);
+}
+function atualizarMenuSubcategoriasLancamento(shIn, subs){
+  const sh=shIn||_getLanc_(); if(!sh) return; const firstRow=4;
+  const lastUsed=Math.max(firstRow, sh.getLastRow()); const buffer=400;
+  const totalRows=Math.min(LIMITE_LINHAS, (lastUsed-firstRow+1)+buffer); if(totalRows<=0) return;
+  _applyDVIfChanged_(sh.getRange(firstRow, COL.SUBCATEGORIA, totalRows,1), subs, false);
+}
+function atualizarMenuFormasLancamento(shIn, formas){
+  const sh=shIn||_getLanc_(); if(!sh) return; const firstRow=4;
+  const lastUsed=Math.max(firstRow, sh.getLastRow()); const buffer=400;
+  const totalRows=Math.min(LIMITE_LINHAS, (lastUsed-firstRow+1)+buffer); if(totalRows<=0) return;
+  const rng=sh.getRange(firstRow, COL.FORMA, totalRows,1);
+  if(!formas||!formas.length){ rng.clearDataValidations(); return; }
+  _applyDVIfChanged_(rng, formas, false);
+}
+
+/** DVs numéricas + status (financeiro-safe) */
+function ensureDVStatusLancamento_(){
+  const sh=_getLanc_(); if(!sh) return; const firstRow=4;
+  const lastUsed=Math.max(firstRow, sh.getLastRow()); const buffer=400;
+  const totalRows=Math.min(LIMITE_LINHAS, (lastUsed-firstRow+1)+buffer); if(totalRows<=0) return;
+  const lista=["Pendente","Conciliado"];
+  const dvStatus=SpreadsheetApp.newDataValidation().requireValueInList(lista,true).setAllowInvalid(false).build();
+  sh.getRange(firstRow, COL.STATUS, totalRows, 1).setDataValidation(dvStatus);
+}
+function ensureDVNumericasLancamento_(){
+  const sh = _getLanc_(); if(!sh) return;
+  const firstRow = 4;
+  const lastUsed = Math.max(firstRow, sh.getLastRow());
+  const buffer   = 400;
+  const LIM      = Math.max(1, Number(typeof LIMITE_LINHAS!=='undefined' ? LIMITE_LINHAS : 2000) || 2000);
+  const n        = Math.min(LIM, (lastUsed - firstRow + 1) + buffer);
+  if (n<=0) return;
+
+  const dvParc = SpreadsheetApp.newDataValidation().requireNumberGreaterThan(0).setAllowInvalid(false).build();
+  const dvData = SpreadsheetApp.newDataValidation().requireDateOnOrAfter(new Date(2000,0,1)).setAllowInvalid(false).build();
+  const dvValor= SpreadsheetApp.newDataValidation().requireNumberBetween(-1e9, 1e9).setAllowInvalid(true).build();
+
+  sh.getRange(firstRow, COL.PARCELAS,       n, 1).setDataValidation(dvParc);
+  sh.getRange(firstRow, COL.DATA,           n, 1).setDataValidation(dvData);
+  sh.getRange(firstRow, COL.VALOR,          n, 1).setDataValidation(dvValor);
+  sh.getRange(firstRow, COL.VALOR_PARCELADO,n, 1).setDataValidation(dvValor);
+}
+/** DV dependente (Detalhamento por Sub) */
+function atualizarMenusDinamicos(sheetIn, cfgIn, startRow, numRows){
+  const sheet=sheetIn||_getLanc_(); const cfg=cfgIn||_getCfg_(); if(!sheet||!cfg||numRows<=0) return;
+  const maxRow=_cfgLastRow_(cfg);
+  const dados=cfg.getRange(3,5,maxRow-2,2).getValues(); // E=Detalhamento, F=Sub
+  const mapa={}; for(let i=0;i<dados.length;i++){ const det=String(dados[i][0]||'').trim(); const sub=String(dados[i][1]||'').trim(); if(sub&&det) (mapa[sub]=(mapa[sub]||[])).push(det); }
+  const subsEditadas=sheet.getRange(startRow, COL.SUBCATEGORIA, numRows,1).getValues().flat();
+  const novas=subsEditadas.map(sub=>{ const opcoes=sub?(mapa[sub]||[]):null; if(opcoes&&opcoes.length){ return SpreadsheetApp.newDataValidation().requireValueInList(opcoes,true).setAllowInvalid(true).build(); } return null; });
+  sheet.getRange(startRow, COL.DETALHAMENTO, numRows,1).setDataValidations(novas.map(v=>[v]));
+}
+
+/** Utilitário: corrigir DV da coluna FORMA sob demanda */
+function corrigirDVFormaAgora_(){ const sh=_getLanc_(), cfg=_getCfg_(); if(!sh||!cfg) return; try{ const formas=listaFormasComCartoes_(cfg); atualizarMenuFormasLancamento(sh, formas); }catch(_){ } }
+
+/***************************************************************
+ * [1C] IDs, Status/Liquidação, Competências, Fechamento/Proteções,
+ *      Resumos (mensal + cartões), Visual/CF, Recalcs e onEdit
+ ***************************************************************/
+
+/* ========= Getters de ano/mode e helpers de metas/itens ========= */
+function getAnoRef_(cfgIn){
+  const cfg=cfgIn||_getCfg_(); if(!cfg) return (new Date()).getFullYear();
+  const a1=_cfgMap_(cfg).ANOREF_CELL||'I14'; const v=cfg.getRange(a1).getValue();
+  if (v instanceof Date && !isNaN(v)) return v.getFullYear();
+  const n=Number(v); if(Number.isFinite(n)&&n>=1900&&n<=9999) return Math.floor(n);
+  const s=String(v||"").trim(); const m=s.match(/^\d{4}$/); return m?Number(s):null;
+}
+function getCompMode_(cfgIn){
+  const cfg=cfgIn||_getCfg_(); if(!cfg) return 'CAIXA';
+  const a1=_cfgMap_(cfg).COMP_MODE_CELL||'I15';
+  const raw=String((cfg.getRange(a1).getValue()||'')).trim().toUpperCase();
+  return raw.indexOf('CONSUMO')>=0?'CONSUMO':'CAIXA';
+}
+function _metaMensalMap_(){
+  const sh=getSheetSmart_(ABAS.PREVISAO_GASTOS,['Previsao de Gastos']); const mapa=new Map(); if(!sh) return mapa;
+  const last=Math.max(2, sh.getLastRow()); if(last<2) return mapa;
+  const itens=sh.getRange(2,1,last-1,1).getValues().flat();
+  const metas=sh.getRange(2,3,last-1,1).getValues().flat();
+  for(let i=0;i<itens.length;i++){ const k=String(itens[i]||'').trim(); const v=Number(metas[i]||0); if(k) mapa.set(k,v); }
+  return mapa;
+}
+function _itemKeyFromSubDet_(sub, det){
+  const cfg=_getCfg_(); if(!cfg) return String(sub||'').trim();
+  const last=_cfgLastRow_(cfg);
+  const dets=new Set(cfg.getRange(3,5,last-2,1).getValues().flat().filter(String));
+  const d=String(det||'').trim(), s=String(sub||'').trim();
+  return d && dets.has(d) ? d : s;
+}
+function _mesKey_(d){ const tz=_tz_(); const base=new Date(d.getFullYear(), d.getMonth(), 1); return Utilities.formatDate(base, tz, 'MM/yyyy'); }
+
+/* ================= Batch writers (menos I/O, escritas em bloco) ================= */
+function _setColValuesBatch_(sheet, col, entries){
+  if(!entries||!entries.length) return; entries.sort((a,b)=>a.r-b.r);
+  let i=0; while(i<entries.length){ let start=entries[i].r; let block=[[entries[i].v]]; let j=i+1;
+    while(j<entries.length && entries[j].r===start+(j-i)){ block.push([entries[j].v]); j++; }
+    sheet.getRange(start,col,block.length,1).setValues(block); i=j;
+  }
+}
+function _setColFormatBatch_(sheet, col, entries){
+  if(!entries||!entries.length) return; entries.sort((a,b)=>a.r-b.r);
+  let i=0; while(i<entries.length){ let start=entries[i].r, fmt=entries[i].fmt, len=1, j=i+1;
+    while(j<entries.length && entries[j].fmt===fmt && entries[j].r===start+(j-i)){ len++; j++; }
+    sheet.getRange(start,col,len,1).setNumberFormat(fmt); i=j;
+  }
+}
+function _setColNotesBatch_(sheet, col, entries){
+  if(!entries||!entries.length) return; entries.sort((a,b)=>a.r-b.r);
+  for(const {r, note} of entries){ sheet.getRange(r,col).setNote(note||''); }
+}
+
+/* ===================== IDs / Status / Competências defaults ===================== */
+function _eqNum_(a,b){ return Math.abs(Number(a||0)-Number(b||0)) < EPS_CENT; }
+function _parcelasExatas_(total, n){
+  n = Math.max(1, parseInt(n,10)||1);
+  const totC = toCents_(total);
+  const sign = totC < 0 ? -1 : 1;
+  const abs  = Math.abs(totC);
+  const base = Math.floor(abs/n), rest = abs - base*n;
+  return Array.from({length:n}, (_,i)=> sign*(base+(i<rest?1:0))/100);
+}
+
+function _gerarIdExtrato_(sheet, r, rowVals, forceOrOpts){
+  const opts = (forceOrOpts && typeof forceOrOpts === 'object') ? forceOrOpts : { force: !!forceOrOpts, returnOnly: false };
+  const force = !!opts.force, returnOnly = !!opts.returnOnly;
+
+  const tz=_tz_();
+  const d0=rowVals[0];
+  const d=(d0 instanceof Date && !isNaN(d0)) ? _dateOnly_(d0) : parseDateBR_(d0);
+  const dStr=d ? Utilities.formatDate(d, tz, "yyyy-MM-dd") : "";
+
+  const sub   = rowVals[COL.SUBCATEGORIA - COL.DATA] || "",
+        det   = rowVals[COL.DETALHAMENTO - COL.DATA] || "",
+        cat   = rowVals[COL.CATEGORIA    - COL.DATA] || "",
+        forma = rowVals[COL.FORMA        - COL.DATA] || "";
+  const nRaw  = Number(rowVals[COL.PARCELAS - COL.DATA] || 1);
+  const n     = (isFinite(nRaw) && nRaw > 0) ? nRaw : 1;
+
+  const totalCents = toCents_(rowVals[COL.VALOR - COL.DATA]);
+  const parcCents  = toCents_(rowVals[COL.VALOR_PARCELADO - COL.DATA]);
+  const centsBase  = (totalCents !== 0) ? totalCents : (parcCents * n);
+
+  const payload=[ dStr, sub, det, cat, forma, n, (centsBase/100).toFixed(2) ].join("|");
+  const hex=Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, payload).map(b=>('0'+(b&0xFF).toString(16)).slice(-2)).join('').toUpperCase();
+  const id = "TX#" + hex.slice(0,10);
+
+  if (!returnOnly && sheet && r){
+    const cell = sheet.getRange(r, COL.ID_EXTRATO);
+    if (!cell.getValue() || force) cell.setValue(id);
+  }
+  return id;
+}
+function _tratarMudancaStatus_(sheet, r, status){
+  const liqCell=sheet.getRange(r, COL.LIQUIDACAO);
+  if (_isConciliadoStatus_(status)){ if(!liqCell.getValue()) liqCell.setValue(_today_()); }
+  else if (/pendente/i.test(String(status||""))){ liqCell.clearContent(); }
+}
+function _tiposDefault_(cfgIn){
+  const cfg=cfgIn||_getCfg_(); if(!cfg) return 'Variável';
+  const last=_cfgLastRow_(cfg);
+  const lista=cfg.getRange(3,11,last-2,1).getValues().flat().filter(String);
+  const pref=lista.find(t=>['variavel','variável'].includes(_norm(t)));
+  return pref||lista[0]||'Variável';
+}
+function _centroCustoDefault_(cfgIn){
+  const cfg=cfgIn||_getCfg_(); if(!cfg) return 'Casa';
+  const last=_cfgLastRow_(cfg);
+  const lista=cfg.getRange(3,10,last-2,1).getValues().flat().filter(String);
+  const casa=lista.find(x=>_norm(x)==='casa'); return casa||lista[0]||'Casa';
+}
+function _rowFingerprint_(rowVals){
+  const tz=_tz_(), d0=rowVals[0];
+  const d=(d0 instanceof Date&&!isNaN(d0))?_dateOnly_(d0):parseDateBR_(d0);
+  const dStr=d?Utilities.formatDate(d, tz, "yyyy-MM-dd"):"";
+
+  const sub = rowVals[COL.SUBCATEGORIA - COL.DATA]||"",
+        det = rowVals[COL.DETALHAMENTO - COL.DATA]||"",
+        cat = rowVals[COL.CATEGORIA    - COL.DATA]||"",
+        forma=rowVals[COL.FORMA        - COL.DATA]||"";
+  const n   = Number(rowVals[COL.PARCELAS - COL.DATA]||1);
+
+  const totalCents = toCents_(rowVals[COL.VALOR - COL.DATA]);
+  const parcCents  = toCents_(rowVals[COL.VALOR_PARCELADO - COL.DATA]);
+  const centsBase  = (totalCents !== 0) ? totalCents : (parcCents * (isFinite(n)&&n>0?n:1));
+
+  const payload=[ dStr, sub, det, cat, forma, n, (centsBase/100).toFixed(2) ].join('|');
+  const hex=Utilities.computeDigest(Utilities.DigestAlgorithm.MD5,payload).map(b=>('0'+(b&0xFF).toString(16)).slice(-2)).join('');
+  return hex.slice(0,10).toUpperCase();
+}
+
+/* ===================== Fechamento de mês & Proteções ===================== */
+function _keyFechados_(){ return 'meses_fechados_v2'; }
+function _competenciaDaLinha_(rowVals){
+  const kVal=rowVals[COL.COMPETENCIA - COL.DATA];
+  if(kVal instanceof Date && !isNaN(kVal)) return new Date(kVal.getFullYear(), kVal.getMonth(), 1);
+  const k=String(kVal||'').trim();
+  if(/^\d{2}\/\d{4}$/.test(k)){ const [mm,yyyy]=k.split('/').map(Number); return new Date(yyyy, mm-1, 1); }
+  const d0=rowVals[0], d=(d0 instanceof Date && !isNaN(d0))?d0:parseDateBR_(d0);
+  return d?new Date(d.getFullYear(), d.getMonth(), 1):null;
+}
+function _estaFechadoPorComp_(rowVals){
+  const dp=PropertiesService.getDocumentProperties();
+  const set=new Set((dp.getProperty(_keyFechados_())||'').split(',').filter(Boolean));
+  const base=_competenciaDaLinha_(rowVals); if(!base) return false;
+  const k=Utilities.formatDate(base, _tz_(), 'MM/yyyy'); return set.has(k);
+}
+function _addMesFechado_(mmYYYY){
+  const dp=PropertiesService.getDocumentProperties();
+  const cur=new Set((dp.getProperty(_keyFechados_())||'').split(',').filter(Boolean));
+  cur.add(mmYYYY); dp.setProperty(_keyFechados_(), Array.from(cur).join(','));
+}
+function _rmMesFechado_(mmYYYY){
+  const dp=PropertiesService.getDocumentProperties();
+  const cur=new Set((dp.getProperty(_keyFechados_())||'').split(',').filter(Boolean));
+  cur.delete(mmYYYY); dp.setProperty(_keyFechados_(), Array.from(cur).join(','));
+}
+function fecharMesAtual_(){
+  const hoje=_today_();
+  const k=Utilities.formatDate(new Date(hoje.getFullYear(),hoje.getMonth(),1), _tz_(), 'MM/yyyy');
+  _addMesFechado_(k);
+  try{ aplicarProtecaoLinhasFechadas_(); }catch(_){}
+  _maybeToast_('🔒 Mês fechado: '+k);
+}
+function reabrirMesAtual_(){
+  const hoje=_today_();
+  const k=Utilities.formatDate(new Date(hoje.getFullYear(),hoje.getMonth(),1), _tz_(), 'MM/yyyy');
+  _rmMesFechado_(k);
+  try{ aplicarProtecaoLinhasFechadas_(); }catch(_){}
+  _maybeToast_('🔓 Mês reaberto: '+k);
+}
+function _mergeContiguous(rows){
+  rows=(rows||[]).slice().sort((a,b)=>a-b);
+  const out=[]; let s=null,p=null;
+  for(const r of rows){ if(s==null){ s=p=r; continue; } if(r===p+1){ p=r; } else { out.push([s,p]); s=p=r; } }
+  if(s!=null) out.push([s,p]); return out;
+}
+function _colLetter_(n){ let s=''; for(; n>0; n=Math.floor((n-1)/26)){ s=String.fromCharCode(65+(n-1)%26)+s; } return s; }
+function aplicarProtecaoLinhasFechadas_(){
+  if (features_().NO_PROTECT) return;
+  const sh=_getLanc_(); if(!sh) return;
+  const PREFIX='LOCK::MFECHADO';
+
+  (sh.getProtections(SpreadsheetApp.ProtectionType.RANGE)||[])
+    .filter(p=>(p.getDescription()||'').startsWith(PREFIX))
+    .forEach(p=>{ try{ p.remove(); }catch(_){ } });
+
+  const dp=PropertiesService.getDocumentProperties();
+  const fech=(dp.getProperty(_keyFechados_())||'').split(',').filter(Boolean);
+  if(!fech.length) return;
+
+  const first=4, last=sh.getLastRow(); if(last<first) return;
+  const lastCol=sh.getLastColumn(), tz=_tz_();
+
+  const comps=sh.getRange(first, COL.COMPETENCIA, last-first+1,1).getValues().flat();
+  const datas=sh.getRange(first, COL.DATA,        last-first+1,1).getValues().flat();
+  const keyOf=(d)=>Utilities.formatDate(new Date(d.getFullYear(), d.getMonth(), 1), tz, 'MM/yyyy');
+
+  const byMonth=new Map();
+  for(let i=0;i<comps.length;i++){
+    const base=(comps[i] instanceof Date && !isNaN(comps[i]))?comps[i]:(datas[i] instanceof Date && !isNaN(datas[i])?datas[i]:null);
+    if(!base) continue;
+    const key=keyOf(base); if(!fech.includes(key)) continue;
+    const row=first+i; (byMonth.get(key)||byMonth.set(key,[]).get(key)).push(row);
+  }
+
+  const openCols=new Set([COL.STATUS, COL.CENTRO_CUSTO, COL.TIPO, COL.LIQUIDACAO]);
+  function buildLockedSegments(fromCol, toCol){
+    const segs=[]; let s=null;
+    for(let c=fromCol;c<=toCol;c++){
+      if(openCols.has(c)){ if(s!=null){ segs.push([s,c-1]); s=null; } }
+      else { if(s==null) s=c; }
+    }
+    if(s!=null) segs.push([s,toCol]); return segs;
+  }
+  const colSegs=buildLockedSegments(COL.DATA, lastCol);
+
+  let created=0;
+  for(const [mmYYYY, rows] of byMonth.entries()){
+    for(const [r0,r1] of _mergeContiguous(rows)){
+      for(const [c1,c2] of colSegs){
+        try{
+          sh.getRange(r0,c1, r1-r0+1, c2-c1+1).protect()
+            .setDescription(`${PREFIX} ${mmYYYY} ${_colLetter_(c1)}:${_colLetter_(c2)} ${r0}-${r1}`);
+          created++;
+        }catch(_){}
+      }
+    }
+  }
+  try{ _log_('INFO','aplicarProtecaoLinhasFechadas_',0,`protecoes=${created}`); }catch(_){}
+}
+
+/* ===================== Visual/CF da Previsão e Resumo ===================== */
+function ensurePrevisaoProgressoVisual_(){
+  const sh=getSheetSmart_(ABAS.PREVISAO_GASTOS,['Previsao de Gastos']); if(!sh) return;
+  const lastRow=Math.max(2, sh.getLastRow()); if(lastRow<2) return;
+  sh.getRange(1,12,1,2).setValues([['charttype','bar']]); // L1:M1
+  sh.getRange(2,12,1,2).setValues([['max',1]]);
+  sh.getRange(1,14,1,2).setValues([['warn',0.8]]);        // N1:O1
+  sh.getRange(2,14,1,2).setValues([['alert',1]]);
+  try{ sh.hideColumns(12,4); }catch(_){}
+  let loc='';
+  try{ loc=(SS_().getSpreadsheetLocale()||'').toLowerCase(); }
+  catch(_){ try{ loc=(SpreadsheetApp.getActive().getSpreadsheetLocale()||'').toLowerCase(); }catch(__){ loc=''; } }
+  const SEP=(/^(pt|fr|de|es)/.test(loc))?';':',';
+  sh.getRange(2,9,lastRow-1,1).setFormulaR1C1(`=IFERROR(MAX(0${SEP}-RC[-3]))`); // I
+  sh.getRange(2,10,lastRow-1,1).setFormulaR1C1(`=MAX(0${SEP}MIN(1${SEP}1-RC[-1]))`); // J
+  sh.getRange(2,11,lastRow-1,1).setFormulaR1C1(`=IF(RC[-1]>=R2C15${SEP}"Estourou"${SEP}IF(RC[-1]>=R1C15${SEP}"Atenção"${SEP}"OK"))`); // K
+  sh.getRange(2,8,lastRow-1,1).setFormulaR1C1(`=IFERROR(SPARKLINE(RC[1]${SEP}R1C12:R2C13))`); // H
+  try{ sh.getRange(2,9,lastRow-1,2).setNumberFormat('0.00%'); }catch(_){ }
+}
+function ensureCondFormatPrevisao_(){
+  if (features_().NO_COND_FORMAT) return;
+  const sh=getSheetSmart_(ABAS.PREVISAO_GASTOS,['Previsao de Gastos']); if(!sh) return;
+  const { WARN_PCT:warn, ALERT_PCT:alert }=ORC_ALERTS;
+  try{
+    const rules=sh.getConditionalFormatRules(); const keep=[];
+    const touchesHJ=(g)=>{ if(g.getSheet().getSheetId()!==sh.getSheetId()) return false;
+      const c=g.getColumn(), w=g.getNumColumns(), r=g.getRow(), h=g.getNumRows();
+      const lastC=c+w-1, lastR=r+h-1; const hitH=(8>=c&&8<=lastC)&&(lastR>=2); const hitJ=(10>=c&&10<=lastC)&&(lastR>=2); return hitH||hitJ; };
+    for(const r of rules){ const rr=(r.getRanges&&r.getRanges())||[]; if(!rr.some(touchesHJ)) keep.push(r); }
+    const ours=[
+      SpreadsheetApp.newConditionalFormatRule().whenNumberGreaterThanOrEqualTo(alert).setBackground('#F8D7DA').setRanges([sh.getRange('J2:J')]).build(),
+      SpreadsheetApp.newConditionalFormatRule().whenNumberBetween(warn,alert).setBackground('#FFF3CD').setRanges([sh.getRange('J2:J')]).build(),
+      SpreadsheetApp.newConditionalFormatRule().whenNumberLessThan(warn).setBackground('#D4EDDA').setRanges([sh.getRange('J2:J')]).build(),
+      SpreadsheetApp.newConditionalFormatRule().whenFormulaSatisfied('=$J2>='+alert).setBackground('#F8D7DA').setRanges([sh.getRange('H2:H')]).build(),
+      SpreadsheetApp.newConditionalFormatRule().whenFormulaSatisfied('=AND($J2>='+warn+',$J2<'+alert+')').setBackground('#FFF3CD').setRanges([sh.getRange('H2:H')]).build(),
+      SpreadsheetApp.newConditionalFormatRule().whenFormulaSatisfied('=$J2<'+warn).setBackground('#D4EDDA').setRanges([sh.getRange('H2:H')]).build()
+    ];
+    sh.setConditionalFormatRules(keep.concat(ours));
+  }catch(_){}
+}
+function ensureCondFormatResumoUtil_(){
+  if (features_().NO_COND_FORMAT) return;
+  const sh=getSheetSmart_(ABAS.RESUMO_FATURAS,['Resumo de Faturas','Resumo']); if(!sh) return;
+  const { WARN:t1, ALERT:t2 }=utilThresholds_();
+  try{
+    const rules=sh.getConditionalFormatRules(), keep=[];
+    for(const r of rules){
+      const ranges=(r.getRanges&&r.getRanges())||[];
+      const isH2H=ranges.length>0 && ranges.every(g=> g.getSheet().getSheetId()===sh.getSheetId() && g.getColumn()===8 && g.getNumColumns()===1 && g.getRow()>=2 );
+      if(!isH2H) keep.push(r);
+    }
+    const ours=[
+      SpreadsheetApp.newConditionalFormatRule().whenNumberGreaterThanOrEqualTo(t2).setBackground('#F8D7DA').setRanges([sh.getRange('H2:H')]).build(),
+      SpreadsheetApp.newConditionalFormatRule().whenNumberBetween(t1,t2).setBackground('#FFF3CD').setRanges([sh.getRange('H2:H')]).build()
+    ];
+    sh.setConditionalFormatRules(keep.concat(ours));
+  }catch(_){}
+}
+
+/* ===================== Gasto por item (centavos-first) ===================== */
+// Consistência CAIXA: sem cartão = "real" apenas se conciliado **e** data<=hoje.
+
+function _gastoNoMesParaItem_(refMesKey, itemKey, modo /* 'both'|'real'|'prev' */='both', opts){
+  opts = opts || {};
+  const paidKeys   = opts.paidKeys || null;              // Set<string> "CARTAO||MM/yyyy"
+  const usarResumo = !!opts.considerarResumoComoReal;    // usa Resumo p/ decidir se fatura foi paga
+
+  const lanc = _getLanc_(), cfg = _getCfg_();
+  if (!lanc || !cfg || !refMesKey || !itemKey) return 0;
+
+  const compMode = getCompMode_(cfg);
+  const last = lanc.getLastRow();
+  if (last < 4) return 0;
+
+  // bloco principal + status + liquidação (1 leitura por coluna)
+  const rows      = lanc.getRange(4, COL.DATA, last-3, (COL.VALOR_PARCELADO - COL.DATA + 1)).getValues();
+  const statuses  = lanc.getRange(4, COL.STATUS,     last-3, 1).getValues().flat();
+  const liqs      = lanc.getRange(4, COL.LIQUIDACAO, last-3, 1).getValues().flat();
+
+  // detalhamentos oficiais (normalizados)
+  const lastCfg   = _cfgLastRow_(cfg);
+  const detOfRaw  = (lastCfg>2) ? cfg.getRange(3,5,lastCfg-2,1).getValues().flat().filter(Boolean) : [];
+  const detsOficiaisNorm = new Set(detOfRaw.map(x => _normLower_(_stripDiacritics_(String(x)))));
+
+  const tz   = _tz_(), hoje = _today_();
+  const kMes = (d) => Utilities.formatDate(new Date(d.getFullYear(), d.getMonth(), 1), tz, 'MM/yyyy');
+  const want = _normLower_(_stripDiacritics_(String(itemKey||'')));
+
+  let somaCents = 0;
+
+  for (let i=0; i<rows.length; i++){
+    const r            = rows[i];
+    const statusLinha  = String(statuses[i]||'').trim();
+    const liqRaw       = liqs[i];
+
+    const [dataRaw, sub, det, /*cat*/, forma, parcelasRaw, valorRaw, valorParcRaw] = r;
+
+    // match do item: Detalhamento oficial > Sub (normalizados)
+    const detStr = String(det||'').trim();
+    const subStr = String(sub||'').trim();
+    const detN   = _normLower_(_stripDiacritics_(detStr));
+    const subN   = _normLower_(_stripDiacritics_(subStr));
+
+    const detEhOficial = detStr && detsOficiaisNorm.has(detN);
+    const hit = detEhOficial ? (detN === want) : (detN === want || subN === want);
+    if (!hit) continue;
+
+    // data da compra
+    const dt = (dataRaw instanceof Date && !isNaN(dataRaw)) ? dataRaw : parseDateBR_(dataRaw);
+    if (!dt) continue;
+
+    // parcelas (centavos-first)
+    const n          = parseInt(parcelasRaw,10) || 1;
+    const partsCents = _partsCents_(valorRaw, n, valorParcRaw);
+
+    // ======== MODO CONSUMO: tudo no mês da compra =========
+    if (compMode === 'CONSUMO'){
+      if (kMes(dt) !== refMesKey) continue;
+      const soma   = _sumCents_(partsCents);
+      const isReal = _dateOnly_(dt).getTime() <= _dateOnly_(hoje).getTime();
+      if (modo==='both' || (modo==='real'&&isReal) || (modo==='prev'&&!isReal)) somaCents += soma;
+      continue;
+    }
+
+    // ======== MODO CAIXA =========
+    const cartRow = _findCartaoRow_(forma);
+
+    // Sem cartão → mês da própria data; real se (conciliado OU tem liquidação) e data <= hoje
+    if (!cartRow){
+      if (kMes(dt) !== refMesKey) continue;
+      const soma   = _sumCents_(partsCents);
+      const liqOk  = (liqRaw instanceof Date && !isNaN(liqRaw)) || !!parseDateBR_(liqRaw);
+      const concOk = _isConciliadoStatus_(statusLinha);
+      const isReal = (concOk || liqOk) && (_dateOnly_(dt).getTime() <= _dateOnly_(hoje).getTime());
+      if (modo==='both' || (modo==='real'&&isReal) || (modo==='prev'&&!isReal)) somaCents += soma;
+      continue;
+    }
+
+    // Com cartão
+    const venc = _sanitizaDia_(cartRow[1]), ini = _sanitizaDia_(cartRow[2]), fim = _sanitizaDia_(cartRow[3]);
+
+    for (let p=0; p<partsCents.length; p++){
+      const v = partsCents[p] || 0;
+      if (v === 0) continue;
+
+      const dParc = new Date(dt);
+      dParc.setMonth(dParc.getMonth()+p);
+
+      let mesKey = kMes(dParc);
+      let isReal = false; // << política: só "REAL" quando fatura está paga
+
+      if (venc != null && ini != null && fim != null){
+        // ciclo válido → mês da fatura
+        const { mes, ano } = calcularCicloCartao(dParc, ini, fim, venc);
+        mesKey = kMes(new Date(ano, mes-1, 1));
+
+        // REAL somente se houver marcação de paga no Resumo (paidKeys)
+        if (usarResumo && paidKeys){
+          const keyFat = (_stripDiacritics_(String(cartRow[0]||'')).toUpperCase()) + '||' + mesKey;
+          if (paidKeys.has(keyFat)) isReal = true;
+        }
+      } else {
+        // ciclo inválido → conservador: considera PREV até configurar o ciclo (não soma em "real")
+        isReal = false;
+      }
+
+      if (mesKey !== refMesKey) continue;
+      if (modo==='both' || (modo==='real'&&isReal) || (modo==='prev'&&!isReal)) somaCents += v;
+    }
+  }
+
+  return _r2(fromCents_(somaCents));
+}
+
+/* ===================== Resumo mensal (com cartões) ===================== */
+function atualizarResultadosMensaisComCartoes(shLanc, shMes, shCfg, mesNum /*1-12*/, startRow, endRow){
+  if(!shLanc||!shMes||!shCfg) return;
+  mesNum=Math.max(1, Math.min(12, parseInt(mesNum,10)||1));
+
+  const tz=_tz_(), hoje=_today_();
+  const anoRef=getAnoRef_(shCfg)||(new Date()).getFullYear();
+  const compMode=getCompMode_(shCfg);
+
+  // paidKeys via helper (DRY) — faturas marcadas como pagas no Resumo
+  const paidKeys = _getPaidKeysResumo_();
+
+  const somaRealPorSubCents=new Map();
+  const somaPrevPorSubCents=new Map();
+  const addC=(map, sub, cents)=>{ const k=String(sub||'').trim(); if(!k) return; const v=Number(cents)||0; if(!Number.isFinite(v)) return; map.set(k,(map.get(k)||0)+v); };
+
+  const lastLanc=shLanc.getLastRow();
+  if(lastLanc>=4){
+    const rows=shLanc.getRange(4, COL.DATA, lastLanc-3, (COL.VALOR_PARCELADO - COL.DATA + 1)).getValues();
+    const statuses=shLanc.getRange(4, COL.STATUS, lastLanc-3, 1).getValues().flat();
+
+    for(let i=0;i<rows.length;i++){
+      const [data, subRaw, , , forma, parcelasRaw, valorRaw, valorParcRaw]=rows[i];
+      const statusLinha=String(statuses[i]||"").trim();
+      const sub=String(subRaw||'').trim(); if(!sub) continue;
+
+      const n=parseInt(parcelasRaw,10)||1;
+      const partsCents=_partsCents_(valorRaw, n, valorParcRaw);
+
+      const dt=(data instanceof Date && !isNaN(data))?data:parseDateBR_(data); if(!(dt instanceof Date)||isNaN(dt)) continue;
+
+      if(compMode==='CONSUMO'){
+        const soma=_sumCents_(partsCents);
+        const m=dt.getMonth()+1, a=dt.getFullYear();
+        if(a===anoRef && m===mesNum){
+          const futuro=_dateOnly_(dt).getTime()>_dateOnly_(hoje).getTime();
+          addC(futuro?somaPrevPorSubCents:somaRealPorSubCents, sub, soma);
+        }
+        continue;
+      }
+
+      const cartRow=_findCartaoRow_(forma);
+
+      if(!cartRow){
+        const soma=_sumCents_(partsCents);
+        const m=dt.getMonth()+1, a=dt.getFullYear();
+        if(a===anoRef && m===mesNum){
+          const jaPassou=_dateOnly_(dt).getTime()<=_dateOnly_(hoje).getTime();
+          // Sem cartão: “pago” = conciliado e data <= hoje (mantido do seu fluxo)
+          if(!jaPassou) addC(somaPrevPorSubCents, sub, soma);
+          else if(_isConciliadoStatus_(statusLinha)) addC(somaRealPorSubCents, sub, soma);
+          else addC(somaPrevPorSubCents, sub, soma);
+        }
+        continue;
+      }
+
+      const cartaoNome=String(cartRow[0]||"").trim();
+      const venc=_sanitizaDia_(cartRow[1]), ini=_sanitizaDia_(cartRow[2]), fim=_sanitizaDia_(cartRow[3]);
+
+      // === AJUSTE 1: ciclo inválido ⇒ sempre PREV (nunca REAL) ===
+      if(venc==null||ini==null||fim==null){
+        const soma=_sumCents_(partsCents);
+        const m=dt.getMonth()+1, a=dt.getFullYear();
+        if(a===anoRef && m===mesNum){
+          addC(somaPrevPorSubCents, sub, soma);
+        }
+        continue;
+      }
+
+      for(let p=0;p<partsCents.length;p++){
+        const dataParc=new Date(dt); dataParc.setMonth(dataParc.getMonth()+p);
+        const { mes:mFat, ano:aFat }=calcularCicloCartao(dataParc, ini, fim, venc);
+        if(aFat!==anoRef || mFat!==mesNum) continue;
+
+        const vParcCents=partsCents[p]||0; if(vParcCents===0) continue;
+
+        const keyBase=_stripDiacritics_(cartaoNome).toUpperCase();
+        const kFat=keyBase+'||'+Utilities.formatDate(new Date(aFat, mFat-1, 1), tz, "MM/yyyy");
+        const pagaNoResumo=paidKeys.has(kFat);
+
+        // === AJUSTE 2: REAL somente quando pago no Resumo ===
+        if(pagaNoResumo){
+          addC(somaRealPorSubCents, sub, vParcCents);
+        }else{
+          addC(somaPrevPorSubCents, sub, vParcCents);
+        }
+      }
+    }
+  }
+
+  // Blocos de colunas (sub/resumo/previsto)
+  const colSub=[2,6,10,14,18,22,26,30,34];
+  const colRes=[3,7,11,15,19,23,27,31,35];
+  const colPrev=[4,8,12,16,20,24,28,32,36];
+
+  const linhas=Math.max(0, endRow-startRow+1); if(linhas<=0) return;
+
+  const escrever=(cols, getterCents)=>{
+    for(let k=0;k<cols.length;k++){
+      const cSub=colSub[k], cOut=cols[k];
+      const labels=shMes.getRange(startRow,cSub,linhas,1).getValues().flat();
+      const out=labels.map(lbl=>{
+        const key=String(lbl||'').trim(); const cents=key?getterCents(key):0;
+        const val=_r2(fromCents_(cents||0)); return [Number.isFinite(val)?val:0];
+      });
+      shMes.getRange(startRow,cOut,linhas,1).setValues(out);
+    }
+  };
+  escrever(colRes, key=>somaRealPorSubCents.get(key)||0);
+  escrever(colPrev, key=>somaPrevPorSubCents.get(key)||0);
+}
+
+/* ===================== Alertas de orçamento por linha ===================== */
+function _r2(n){ if(!isFinite(n)) throw new Error("Valor inválido: "+n); return Math.round(n*100)/100; }
+function _orcamentoAvisarSeUltrapassarLinha_(sheet, r){
+  const cfg=_getCfg_(); if(!cfg) return;
+
+  const row=sheet.getRange(r, COL.DATA, 1, (COL.VALOR_PARCELADO - COL.DATA + 1)).getValues()[0];
+  const dataRaw=row[0], sub=row[1], det=row[2], forma=row[4];
+  const dt=(dataRaw instanceof Date && !isNaN(dataRaw))?dataRaw:parseDateBR_(dataRaw); if(!dt) return;
+
+  const compMode=getCompMode_(cfg);
+  let refDate=new Date(dt.getFullYear(), dt.getMonth(), 1);
+  if(compMode==='CAIXA'){
+    const cartRow=_findCartaoRow_(forma);
+    if(cartRow){
+      const venc=_sanitizaDia_(cartRow[1]), ini=_sanitizaDia_(cartRow[2]), fim=_sanitizaDia_(cartRow[3]);
+      if(venc!=null && ini!=null && fim!=null){
+        const info=calcularCicloCartao(dt, ini, fim, venc);
+        refDate=new Date(info.ano, info.mes-1, 1);
+      }
+    }
+  }
+  const refKey=_mesKey_(refDate);
+  const itemKey=_itemKeyFromSubDet_(sub, det); if(!itemKey) return;
+
+  const metas=_metaMensalMap_(); const meta=Number(metas.get(itemKey)||0); if(!(meta>0)) return;
+
+  const paidKeys = _getPaidKeysResumo_();
+  const gastoMes=_gastoNoMesParaItem_(refKey, itemKey, 'both', { paidKeys, considerarResumoComoReal:true });
+
+  const ratio=gastoMes/meta;
+  if(ratio>=ORC_ALERTS.ALERT_PCT){
+    _maybeToast_(`🚨 Orçamento: "${itemKey}" em ${refKey} estourou (R$ ${gastoMes.toFixed(2)} / R$ ${meta.toFixed(2)})`);
+  }else if(ratio>=ORC_ALERTS.WARN_PCT){
+    _maybeToast_(`⚠️ Orçamento: "${itemKey}" em ${refKey} atingiu ${Math.round(ratio*100)}% da meta (R$ ${gastoMes.toFixed(2)} / R$ ${Number(meta).toFixed(2)})`);
+  }
+}
+
+/* ===================== Recalcular agora (lean) ===================== */
+function withDocLock_(fn, timeoutMs){
+  const lock = LockService.getDocumentLock();
+  const t = Math.max(1, Number(timeoutMs)||20000);
+  if (!lock.tryLock(t)){ _maybeToast_('⏳ Operação em andamento. Tente novamente em instantes.'); return; }
+  try{ return fn && fn(); } finally { try{ lock.releaseLock(); }catch(_){ } }
+}
+function doRecalcsNow_(opts={}){
+  return withDocLock_(()=>{
+    try{
+      if(opts.faturas){
+        try{ if(typeof gerarFaturasDeCartao_==='function') gerarFaturasDeCartao_(); else _log_('WARN','doRecalcsNow_',0,'missing gerarFaturasDeCartao_'); }catch(err){ _log_('ERROR','doRecalcsNow_',0,'gerarFaturasDeCartao_: '+(err&&err.message||err)); }
+        try{ if(typeof atualizarResumoFaturas_==='function') atualizarResumoFaturas_(); else _log_('WARN','doRecalcsNow_',0,'missing atualizarResumoFaturas_'); }catch(err){ _log_('ERROR','doRecalcsNow_',0,'atualizarResumoFaturas_: '+(err&&err.message||err)); }
+        try{ if(typeof rebuildParcelasCartao_==='function') rebuildParcelasCartao_(); else _log_('WARN','doRecalcsNow_',0,'missing rebuildParcelasCartao_'); }catch(err){ _log_('ERROR','doRecalcsNow_',0,'rebuildParcelasCartao_: '+(err&&err.message||err)); }
+        try{ if(typeof sincronizarStatusLancamentosComResumo_==='function') sincronizarStatusLancamentosComResumo_({ downgrade:true }); else _log_('WARN','doRecalcsNow_',0,'missing sincronizarStatusLancamentosComResumo_'); }catch(err){ _log_('ERROR','doRecalcsNow_',0,'sincronizarStatusLancamentosComResumo_: '+(err&&err.message||err)); }
+      }
+    }catch(_){}
+
+    try{
+      if(typeof atualizarPrevisaoCompleta_==='function') { atualizarPrevisaoCompleta_({ overwriteMetas:false }); }
+      else { _log_('WARN','doRecalcsNow_',0,'missing atualizarPrevisaoCompleta_'); }
+      ensurePrevisaoProgressoVisual_();
+      ensureCondFormatPrevisao_();
+      runBudgetSweep_();
+    }catch(err){ _log_('ERROR','doRecalcsNow_',0,'previsao/budget: '+(err&&err.message||err)); }
+
+    try{ ensureCondFormatResumoUtil_(); }catch(_){}
+  }, 20000);
+}
+
+/* ===================== Sweep de orçamento (toast compacto) ===================== */
+function runBudgetSweep_(){
+  const mapa=_metaMensalMap_(); if(!mapa.size) return;
+  const hoje=_today_(), refKey=Utilities.formatDate(new Date(hoje.getFullYear(), hoje.getMonth(), 1), _tz_(), 'MM/yyyy');
+
+  const paidKeys = _getPaidKeysResumo_();
+
+  const hits=[];
+  for(const [item, meta] of mapa.entries()){
+    const gasto=_gastoNoMesParaItem_(refKey, item, 'both', { paidKeys, considerarResumoComoReal:true });
+    const pct=meta?gasto/meta:0;
+    if(pct>=ORC_ALERTS.WARN_PCT){
+      const tag=(pct>=ORC_ALERTS.ALERT_PCT?'🚨':'⚠️');
+      hits.push(`${tag} ${item}: ${Math.round(pct*100)}% (R$ ${gasto.toFixed(2)} / R$ ${Number(meta).toFixed(2)})`);
+    }
+  }
+  if(hits.length){
+    const msg=hits.length<=3?hits.join('\n'):`${hits.slice(0,3).join('\n')}\n… +${hits.length-3} itens`;
+    _maybeToast_(msg);
+  }
+}
+
+function _getPaidKeysResumo_(){
+  const set = new Set();
+  const shRes = getSheetSmart_(ABAS.RESUMO_FATURAS, ['Resumo de Faturas','Resumo']);
+  if (!shRes) return set;
+
+  const tz = _tz_();
+  const last = shRes.getLastRow();
+  if (last < 2) return set;
+
+  const rows = shRes.getRange(2, 1, last-1, 9).getValues();
+  for (const r of rows){
+    const cartao = String(r[0]||'').trim();
+    const mesVal = r[1];
+    const pendStr = String(r[3]??'').trim();
+    if (!(cartao && mesVal)) continue;
+
+    const mesDate = (mesVal instanceof Date && !isNaN(mesVal)) ? new Date(mesVal.getFullYear(), mesVal.getMonth(), 1) : null;
+    const mesStr  = mesDate ? Utilities.formatDate(new Date(mesDate.getFullYear(), mesDate.getMonth(), 1), tz, 'MM/yyyy')
+                            : String(mesVal||'').trim();
+
+    const key = (_stripDiacritics_(cartao).toUpperCase()) + '||' + mesStr;
+    const pendOk = Math.abs(toCents_(pendStr)/100) <= EPS_CENT;
+    if (pendOk) set.add(key);
+  }
+  return set;
+}
+
+/* ===================== onEdit===================== */
+function onEdit(e){
+  try{
+    if(!e || !e.range) return;
+
+    const { range } = e;
+    const sheet = range.getSheet();
+    const nomeAba = sheet.getName();
+    const nomeAbaNorm = _normLower_(nomeAba);
+
+    const colIni = range.getColumn(), rowIni = range.getRow();
+    const numRows = range.getNumRows(), numCols = range.getNumColumns();
+    const colFim = colIni + numCols - 1;
+    const colHit = (...cols) => cols.some(c => c >= colIni && c <= colFim);
+    const singleCellEdit = (numRows === 1 && numCols === 1);
+
+    // 🚧 Guard anti-colagem grande
+    if (numRows > (SAFETY.MAX_PASTE_ROWS||2000) || numCols > (SAFETY.MAX_PASTE_COLS||20)){
+      _maybeToast_(`⚠️ Colagem grande detectada (${numRows}×${numCols}). Quebre em partes ou use "Recalcular agora".`);
+      try{ _log_('WARN','onEdit_guard',{rows:numRows,cols:numCols}); }catch(_){}
+      return;
+    }
+
+    // Auditoria leve na aba de Config
+    const oldV = (typeof e.oldValue==='undefined') ? '' : e.oldValue;
+    const newV = (typeof e.value   ==='undefined') ? '' : e.value;
+    try{
+      if (singleCellEdit){
+        const isCfg = (nomeAbaNorm===_normLower_(ABAS.CONFIGURACOES) || nomeAbaNorm==='configuracoes');
+        if (isCfg){ _log_('AUDIT','CONFIG',0,`${sheet.getName()}!${range.getA1Notation()} | ${oldV} → ${newV}`); }
+      }
+    }catch(_){}
+
+    const shCfg = _getCfg_(), shLanc = _getLanc_();
+    if(!shCfg || !shLanc) return;
+
+    // Cache local para a edição
+    const cartRowCache = new Map();
+    function getCartRow(forma){
+      const key=_normLower_(String(forma||'')); if(!key) return null;
+      if(cartRowCache.has(key)) return cartRowCache.get(key);
+      let r=null; try{ r=_findCartaoRow_(forma); }catch(_){ r=null; }
+      cartRowCache.set(key,r); return r;
+    }
+
+    // Centro de custo por cartão (coluna M, índice 5 do _rangeCartoes_)
+    const cardCentersByName = new Map();
+    try{
+      const rows = getCartoesCached_(shCfg,false) || [];
+      for (const rr of rows){
+        const nome = String(rr[0]||'').trim(); if(!nome) continue;
+        const cc   = String(rr[5]||'').trim();
+        const key  = _normLower_(_stripDiacritics_(nome));
+        if (cc && !cardCentersByName.has(key)) cardCentersByName.set(key, cc);
+      }
+    }catch(_){}
+
+    /* ========== FATURAS DE CARTÃO ========== */
+    if (nomeAbaNorm === _normLower_(ABAS.FATURAS_CARTAO)){
+      const tocou = [5,6,8,9,10].some(c => c>=colIni && c<=colFim);
+      if (tocou){ doRecalcsNow_({ faturas:true, resumo:true }); }
+      return;
+    }
+
+    /* ========== CONFIGURAÇÕES ========== */
+    if (nomeAbaNorm===_normLower_(ABAS.CONFIGURACOES) || nomeAbaNorm==='configuracoes'){
+      _invalidateCfgCaches_();
+
+      const map         = _cfgMap_(shCfg);
+      const isAnoRef    = _isEditedCell_(sheet,rowIni,colIni,map.ANOREF_CELL,range);
+      const isCompMode  = _isEditedCell_(sheet,rowIni,colIni,map.COMP_MODE_CELL,range);
+      const colIsCards  = (colIni>=map.CARTOES_FIRST_COL && colIni<=map.CARTOES_LAST_COL && rowIni>=map.CARTOES_FIRST_ROW);
+      const linhaFim    = rowIni + numRows - 1;
+      const isFormasIdxEdit = (colIni<=8 && colFim>=8 && rowIni<=11 && linhaFim>=3);
+
+      const mudou = (('value' in e)||('oldValue' in e)) ? (e.value!==e.oldValue) : true;
+      if(!mudou) return;
+
+      if (colIsCards || isAnoRef || isFormasIdxEdit){
+        try{ atualizarMenuFormasLancamento(shLanc, listaFormasComCartoes_(shCfg)); }catch(_){}
+        try{ aplicarProtecaoLinhasFechadas_(); }catch(_){}
+        doRecalcsNow_({ faturas:true, previsao:true, resumo:true });
+        return;
+      }
+      if (isCompMode){
+        doRecalcsNow_({ faturas:true, previsao:true, resumo:true });
+        return;
+      }
+      if (colHit(2,3,5)){
+        const cats = listaCategorias_(shCfg), subs = listaSubcategorias_(shCfg);
+        atualizarMenuCategoriasLancamento(shLanc, cats);
+        atualizarMenuSubcategoriasLancamento(shLanc, subs);
+        try{ atualizarMenuFormasLancamento(shLanc, listaFormasComCartoes_(shCfg)); }catch(_){}
+        doRecalcsNow_({ previsao:true, resumo:true });
+        return;
+      }
+      return;
+    }
+
+    /* ========== LANÇAMENTO DE DESPESA ========== */
+    const isLanc = (nomeAbaNorm===_normLower_(ABAS.LANCAMENTO_DESPESA) || nomeAbaNorm==='lancamento de despesa');
+    if (isLanc){
+      if (rowIni < 4) return;
+
+      const relevante = colHit(
+        COL.DATA, COL.SUBCATEGORIA, COL.DETALHAMENTO, COL.CATEGORIA, COL.FORMA,
+        COL.PARCELAS, COL.VALOR, COL.VALOR_PARCELADO, COL.STATUS, COL.LIQUIDACAO
+      );
+      if (!relevante) return;
+
+      const cfgLists      = getCfgCached_(shCfg);
+      const subsCfg       = cfgLists.subs;
+      const catsCfg       = cfgLists.cats;
+      const mapSubToCat   = cfgLists.subToCat;
+      const tiposDefault  = _tiposDefault_(shCfg);
+      const centroDefault = _centroCustoDefault_(shCfg);
+      const categoriasLista = [...new Set(catsCfg)];
+
+      let impactaPrev    = colHit(COL.DATA, COL.SUBCATEGORIA, COL.DETALHAMENTO, COL.FORMA, COL.PARCELAS, COL.VALOR, COL.VALOR_PARCELADO, COL.CATEGORIA);
+      let impactaFaturas = colHit(COL.FORMA, COL.PARCELAS, COL.DATA, COL.VALOR, COL.VALOR_PARCELADO);
+      const precisaAtualizarMenusFixos = colHit(COL.CATEGORIA) || colHit(COL.SUBCATEGORIA);
+
+      const blocoVals   = sheet.getRange(rowIni, COL.DATA, numRows, (COL.ID_EXTRATO - COL.DATA + 1)).getValues();
+      const centrosVals = sheet.getRange(rowIni, COL.CENTRO_CUSTO,   numRows, 1).getValues().flat();
+      const tiposVals   = sheet.getRange(rowIni, COL.TIPO,           numRows, 1).getValues().flat();
+      const fpVals      = sheet.getRange(rowIni, COL_FP,             numRows, 1).getValues().flat();
+
+      const bufData=[], fmtData=[];
+      const bufCat=[];
+      const bufParc=[], bufValParc=[];
+      const bufCompCaixa=[], fmtCompCaixa=[], notesCompCaixa=[];
+      const bufCompCons=[],  fmtCompCons=[];
+      const bufStatus=[], bufLiq=[];
+      const bufCentro=[], bufTipo=[];
+      const bufId=[], bufFP=[];
+
+      const hoje = _today_();
+      const idx  = (c) => c - COL.DATA;
+
+      for (let i=0;i<numRows;i++){
+        const r   = rowIni + i;
+        const row = blocoVals[i].slice();
+        const temAlgo = row.some(v=>v!=='' && v!=null);
+        if (!temAlgo) continue;
+
+        // Linha fechada
+        if (_estaFechadoPorComp_(row)){
+          if (![COL.STATUS, COL.LIQUIDACAO, COL.CENTRO_CUSTO, COL.TIPO].some(c => c>=colIni && c<=colFim)){
+            _maybeToast_('🔒 Mês fechado: só Status, Liquidação, Centro de Custo e Tipo podem mudar.');
+            continue;
+          }
+          const stNow = String(row[idx(COL.STATUS)]||'').trim();
+          const liqNow = row[idx(COL.LIQUIDACAO)];
+          if (_isConciliadoStatus_(stNow) && !liqNow) bufLiq.push({r,v:_today_()});
+          else if (/pendente/i.test(stNow))          bufLiq.push({r,v:''});
+          continue;
+        }
+
+        // 1) Data
+        const dtRaw = row[idx(COL.DATA)];
+        let d = (dtRaw instanceof Date && !isNaN(dtRaw)) ? _dateOnly_(dtRaw) : parseDateBR_(dtRaw);
+        const sub = String(row[idx(COL.SUBCATEGORIA)]||'').trim();
+        const det = String(row[idx(COL.DETALHAMENTO)]||'').trim();
+        if (!d && (sub||det)) d = _today_();
+        if (d){ bufData.push({r,v:d}); fmtData.push({r,fmt:'dd/MM/yyyy'}); row[idx(COL.DATA)]=d; }
+
+        // 2) Categoria sugerida
+        let cat   = String(row[idx(COL.CATEGORIA)]||'').trim();
+        let forma = String(row[idx(COL.FORMA)]||'').trim();
+        if (sub){
+          const catDesejada = mapSubToCat[sub] || '';
+          if (cat !== catDesejada){ cat = catDesejada; bufCat.push({r,v:cat}); row[idx(COL.CATEGORIA)]=cat; }
+        }else{
+          if (colHit(COL.SUBCATEGORIA)){
+            sheet.getRange(r, COL.DATA, 1, (COL.ID_EXTRATO - COL.DATA + 1)).clearContent().clearNote().setBackground(null);
+            sheet.getRange(r, COL2.COMP_CONSUMO, 1, 1).clearContent();
+            sheet.getRange(r, COL_FP,          1, 1).clearContent();
+            sheet.getRange(r, COL.DETALHAMENTO).clearDataValidations();
+            impactaPrev = true; impactaFaturas = true; continue;
+          }
+        }
+
+        // 3) Parcelas & valor-parcela (Modelo A: aceita negativo)
+        let parcelas = parseInt(row[idx(COL.PARCELAS)],10);
+        if (!isFinite(parcelas) || parcelas<1) parcelas = 1;
+
+        const valorRaw = row[idx(COL.VALOR)];
+        let   valorPar = row[idx(COL.VALOR_PARCELADO)];
+        const isCartao = ehCartao_(forma);
+
+        const totalCents = toCents_(valorRaw);
+        const parcCents  = toCents_(valorPar);
+        const valorApagado = (colHit(COL.VALOR) && (valorRaw==='' || valorRaw===null));
+
+        if (valorApagado){
+          if (parcCents!==0){
+            // mantém parcela
+          }else{
+            if (parcelas!==1){ parcelas=1; bufParc.push({r,v:1}); }
+            if (valorPar!==''){ valorPar=''; bufValParc.push({r,v:''}); }
+          }
+        }else{
+          if (!isCartao){
+            if (totalCents !== 0 && parcCents === 0){
+              const p0 = fromCents_(_partsCents_(valorRaw, parcelas, null)[0]);
+              if (p0!==0){ valorPar=p0; bufValParc.push({r,v:valorPar}); }
+            }else if (totalCents===0 && parcCents!==0){
+              // ok — mantém valorPar
+            }else{
+              if (valorPar!==''){ valorPar=''; bufValParc.push({r,v:''}); }
+              if (parcelas!==1){ parcelas=1; bufParc.push({r,v:1}); }
+            }
+          }else{
+            if (parcelas<1){ parcelas=1; bufParc.push({r,v:1}); }
+            if (parcCents === 0){
+              const p0 = fromCents_(_partsCents_(valorRaw, parcelas, null)[0]);
+              if (p0!==0){ valorPar=p0; bufValParc.push({r,v:valorPar}); }
+            }
+          }
+        }
+        row[idx(COL.PARCELAS)]        = parcelas;
+        row[idx(COL.VALOR_PARCELADO)] = valorPar;
+
+        // 4) Competências
+        if (!d && colHit(COL.DATA)){
+          bufCompCaixa.push({ r, v: '' });
+          notesCompCaixa.push({ r, note: '' });
+          bufCompCons.push({ r, v: '' });
+        }
+        if (d){
+          const compConsumoDate = new Date(d.getFullYear(), d.getMonth(), 1);
+          let compCaixaDate = compConsumoDate, compNote = '';
+          if (isCartao){
+            const cartRow = getCartRow(forma);
+            if (cartRow){
+              const venc=_sanitizaDia_(cartRow[1]), ini=_sanitizaDia_(cartRow[2]), fim=_sanitizaDia_(cartRow[3]);
+              if (venc!=null && ini!=null && fim!=null){
+                const {mes,ano} = calcularCicloCartao(d, ini, fim, venc);
+                compCaixaDate = new Date(ano, mes-1, 1);
+              }else{
+                compNote='Ciclo inválido → mês da compra';
+              }
+            }
+          }
+          bufCompCaixa.push({r,v:compCaixaDate}); fmtCompCaixa.push({r,fmt:'MM/yyyy'});
+          notesCompCaixa.push({ r, note: compNote ? compNote : '' });
+          bufCompCons .push({r,v:compConsumoDate}); fmtCompCons .push({r,fmt:'MM/yyyy'});
+        }
+
+        // 5) ID de extrato
+        let idExt = String(row[idx(COL.ID_EXTRATO)]||'').trim();
+        if (!idExt){
+          idExt = _gerarIdExtrato_(sheet, r, row, { returnOnly:true });
+          bufId.push({ r, v:idExt });
+          row[idx(COL.ID_EXTRATO)] = idExt;
+        }
+
+        // 6) Status / Liquidação
+        let status = String(row[idx(COL.STATUS)]||'').trim();
+        let liq    = row[idx(COL.LIQUIDACAO)];
+
+        // Edição manual de Liquidação (sem cartão) → sincroniza Status
+        if (!isCartao && colHit(COL.LIQUIDACAO)){
+          const hasDate = (liq instanceof Date && !isNaN(liq)) || !!parseDateBR_(liq);
+          if (hasDate && !_isConciliadoStatus_(status)){ status = "Conciliado"; bufStatus.push({r,v:status}); }
+          if (!hasDate &&  _isConciliadoStatus_(status)){ status = "Pendente";   bufStatus.push({r,v:status}); }
+        }
+
+        const futuro = d && _dateOnly_(d).getTime() > _dateOnly_(hoje).getTime();
+        if (isCartao){
+          if (!status){ status="Pendente"; bufStatus.push({r,v:status}); row[idx(COL.STATUS)]=status; }
+          if (_isConciliadoStatus_(status) && !liq){ liq=_today_(); bufLiq.push({r,v:liq}); }
+        }else{
+          const totalAbs = Math.abs(fromCents_(totalCents));
+          if (futuro && !_isConciliadoStatus_(status)){
+            if (!/pendente/i.test(String(status||""))){ status="Pendente"; bufStatus.push({r,v:status}); row[idx(COL.STATUS)]=status; }
+            if (!_isConciliadoStatus_(status)){ liq=''; bufLiq.push({r,v:''}); row[idx(COL.LIQUIDACAO)]=liq; }
+          }else{
+            if (totalAbs >= EPS_CENT && (!status||status==="")){
+              status="Conciliado"; bufStatus.push({r,v:status}); row[idx(COL.STATUS)]=status;
+              if (!liq){ liq=_today_(); bufLiq.push({r,v:liq}); }
+            }
+          }
+        }
+
+        // 7) Defaults (Centro & Tipo)
+        if (!String(centrosVals[i]??'').trim()){
+          let chosen = centroDefault;
+          try{
+            if (forma){
+              const key = _normLower_(_stripDiacritics_(String(forma)));
+              if (cardCentersByName.has(key)) chosen = cardCentersByName.get(key);
+            }
+          }catch(_){}
+          if (chosen) bufCentro.push({r,v:chosen});
+        }
+        if (!String(tiposVals[i]??'').trim()){
+          bufTipo.push({r,v:tiposDefault});
+        }
+
+        // 8) Fingerprint
+        const fpNew = _rowFingerprint_(row);
+        const fpOld = String(fpVals[i]||'');
+        if (fpNew !== fpOld){
+          bufFP.push({r,v:fpNew});
+        }
+
+        // 9) Alerta de orçamento
+        if (colHit(COL.DATA, COL.SUBCATEGORIA, COL.DETALHAMENTO, COL.FORMA, COL.PARCELAS, COL.VALOR, COL.VALOR_PARCELADO)){
+          try{ _orcamentoAvisarSeUltrapassarLinha_(sheet, r); }catch(_){}
+        }
+      } // loop linhas
+
+      // Escritas em bloco
+      _setColValuesBatch_(sheet, COL.DATA,            bufData);
+      _setColFormatBatch_( sheet, COL.DATA,           fmtData);
+      _setColValuesBatch_(sheet, COL.CATEGORIA,       bufCat);
+      _setColValuesBatch_(sheet, COL.PARCELAS,        bufParc);
+      _setColValuesBatch_(sheet, COL.VALOR_PARCELADO, bufValParc);
+      _setColValuesBatch_(sheet, COL.COMPETENCIA,     bufCompCaixa);
+      _setColFormatBatch_( sheet, COL.COMPETENCIA,    fmtCompCaixa);
+      _setColNotesBatch_(  sheet, COL.COMPETENCIA,    notesCompCaixa);
+      _setColValuesBatch_(sheet, COL2.COMP_CONSUMO,   bufCompCons);
+      _setColFormatBatch_( sheet, COL2.COMP_CONSUMO,  fmtCompCons);
+      _setColValuesBatch_(sheet, COL.STATUS,          bufStatus);
+      _setColValuesBatch_(sheet, COL.LIQUIDACAO,      bufLiq);
+      _setColValuesBatch_(sheet, COL.CENTRO_CUSTO,    bufCentro);
+      _setColValuesBatch_(sheet, COL.TIPO,            bufTipo);
+      _setColValuesBatch_(sheet, COL.ID_EXTRATO,      bufId);
+      _setColValuesBatch_(sheet, COL_FP,              bufFP);
+
+      // Menus dependentes
+      if (precisaAtualizarMenusFixos){
+        atualizarMenuCategoriasLancamento(sheet, categoriasLista);
+        atualizarMenuSubcategoriasLancamento(sheet, subsCfg);
+      }
+      try{ atualizarMenusDinamicos(sheet, shCfg, rowIni, numRows); }catch(_){}
+
+      // Recalc imediato (sem parâmetro "meses")
+      doRecalcsNow_({ faturas: impactaFaturas, previsao: impactaPrev, resumo: true });
+      return;
+    }
+
+    /* ========== ABAS MENSAIS (conveniências) ========== */
+    if (MESES.map(_normLower_).includes(nomeAbaNorm)){
+      if (colIni===3 && rowIni>=20 && rowIni<=50){
+        const editedValue = range.getValue();
+        if (!editedValue) sheet.getRange(rowIni,2,1,5).clearContent();
+        else if (!sheet.getRange(rowIni,2).getValue()) sheet.getRange(rowIni,2).setValue(_today_());
+      }
+      if (colIni===2){
+        try{
+          const start=20, linhas=31;
+          const datas  = sheet.getRange(start,2,linhas,1).getValues();
+          const valores= sheet.getRange(start,3,linhas,1).getValues();
+          let mudou=false;
+          for(let i=0;i<linhas;i++){
+            if(!datas[i][0] && valores[i][0]){ datas[i][0]=_today_(); mudou=true; }
+          }
+          if(mudou) sheet.getRange(start,2,linhas,1).setValues(datas);
+        }catch(_){}
+      }
+      return;
+    }
+
+  }catch(err){
+    Logger.log('onEdit error: ' + (err && err.message ? err.message : err));
+  }
+}

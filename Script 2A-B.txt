@@ -1,0 +1,1473 @@
+/***************************************************************
+ * FINANCEIRO FAMILIAR — SCRIPT UNIFICADO (PARTE 2 — 2A + 2B)
+ * HOTFIX: 28/10/2025 (idempotente, single-user friendly)
+ *
+ * 2A: Faturas & Resumo (infra), limites/exposição, geração de faturas,
+ *     resumo (pagamento parcial) — com cabeçalhos protegidos.
+ * 2B: Previsão/Orçamento, Projeções (mediana/winsor), Auditorias.
+ *
+ * Depende da PARTE 1 (helpers, ABAS/COL/COL2/COL_FP, etc.).
+ ***************************************************************/
+
+/* ===================== Helpers locais do bloco (com hotfixes) ===================== */
+
+// Cria a aba só se NÃO existir (idempotente e "race-safe")
+function _safeEnsureSheet_(name, alternates){
+  const ss = SS_();
+  let sh = getSheetSmart_(name, alternates||[]);
+  if (sh) return sh;
+  try {
+    return ss.insertSheet(name);
+  } catch(e){
+    const msg = String(e && e.message || '');
+    if (msg.includes('Já existe uma página') || /already exists/i.test(msg)){
+      sh = getSheetSmart_(name, alternates||[]);
+      if (sh) return sh;
+    }
+    throw e;
+  }
+}
+
+// Retorna valorParcRaw se presente; senão usa fallback (já normalizado)
+function _parcelaOuFallback_(valorParcRaw, fallback){
+  if (valorParcRaw != null && String(valorParcRaw).trim() !== ''){
+    try { return fromCents_(toCents_(valorParcRaw)); } catch(_){}
+  }
+  return fallback;
+}
+
+// Proteção de cabeçalho (reforçada com editor efetivo)
+function _protectHeaderRow_(sh, opt){
+  if (features_().NO_PROTECT) return;
+  try{
+    const DESC = 'Cabeçalhos protegidos';
+    const dp   = PropertiesService.getDocumentProperties();
+    const key  = 'HDR_PROT_SIG_' + sh.getSheetId();
+    const want = JSON.stringify({ desc:DESC, cols: sh.getMaxColumns(), v:2, row:1 });
+
+    const prots = (sh.getProtections(SpreadsheetApp.ProtectionType.RANGE)||[])
+      .filter(p => (p.getDescription()||'') === DESC);
+
+    const ok = prots.some(p => {
+      try{
+        const rg = p.getRange();
+        return rg && rg.getRow()===1 && rg.getNumRows()===1 &&
+               rg.getColumn()===1 && rg.getNumColumns()===sh.getMaxColumns();
+      }catch(_){ return false; }
+    });
+
+    const force = opt && opt.force === true;
+    if (ok && !force && dp.getProperty(key) === want) return;
+
+    prots.forEach(p => { try{ p.remove(); }catch(_){ } });
+    const rng  = sh.getRange(1,1,1, Math.max(1, sh.getMaxColumns()));
+    const prot = rng.protect().setDescription(DESC);
+    try { prot.setWarningOnly(false); } catch(_){}
+    try { prot.removeEditors(prot.getEditors()); } catch(_){}
+    try { prot.addEditor(Session.getEffectiveUser()); } catch(_){}
+    dp.setProperty(key, want);
+  }catch(_){}
+}
+
+/* ===================== [2A] FATURAS & RESUMO — infra ===================== */
+
+function _ensureResumoHeaders_(){
+  const sh = _safeEnsureSheet_(ABAS.RESUMO_FATURAS, ['Resumo de Faturas']);
+
+  const hdr=[
+    "Cartão","Mês","Total (R$)","Pendentes (R$)","Conciliadas (R$)",
+    "Último Status","CHAVE","Utilização (%)","Exposição Futura (R$)"
+  ];
+
+  // Cabeçalho – só reescreve se diferente
+  const cur=sh.getRange(1,1,1,hdr.length).getValues()[0].map(v=>String(v||"").trim());
+  let changedHeader=false;
+  for(let i=0;i<hdr.length;i++){ if((cur[i]||"")!==hdr[i]){ changedHeader=true; break; } }
+  if(changedHeader){ sh.getRange(1,1,1,hdr.length).setValues([hdr]); }
+
+  // Formatação idempotente por “assinatura” (leve)
+  try{
+    const dp = PropertiesService.getDocumentProperties();
+    const key= 'HDR_FMT_RESUMO_' + sh.getSheetId();
+    const sig= JSON.stringify({ nfB:'MM/yyyy', nfCE:'R$ #,##0.00', nfH:'0.00%', nfI:'R$ #,##0.00', hideC7:true, freeze:[1,1], v:2 });
+    if (dp.getProperty(key) !== sig || changedHeader){
+      sh.getRange("B:B").setNumberFormat("MM/yyyy");
+      sh.getRange("C:E").setNumberFormat("R$ #,##0.00");
+      sh.getRange("H:H").setNumberFormat('0.00%');
+      sh.getRange("I:I").setNumberFormat("R$ #,##0.00");
+      try{ sh.hideColumns(7); }catch(_){}
+      try{ sh.setFrozenRows(1); sh.setFrozenColumns(1); }catch(_){}
+      dp.setProperty(key, sig);
+    }
+  }catch(_){}
+
+  _protectHeaderRow_(sh);
+  return sh;
+}
+
+function _ensureFaturasHeaders_(){
+  const sh = _safeEnsureSheet_(ABAS.FATURAS_CARTAO, ['Faturas de Cartao']);
+
+  const hdr=["Cartão","Mês Referência","Data Vencimento","Valor Fatura","Status Pagamento","Data Pagamento","CHAVE","Valor Pago","Encargos","Créditos","Observações"];
+
+  // Cabeçalho — só reescreve se diferente
+  const cur=sh.getRange(1,1,1,hdr.length).getValues()[0].map(v=>String(v||"").trim());
+  let diff=false; for(let i=0;i<hdr.length;i++){ if(hdr[i]!==cur[i]){ diff=true; break; } }
+  if(diff){ sh.getRange(1,1,1,hdr.length).setValues([hdr]); }
+
+  // Formatos + DV SEM depender de assinatura (evita DV “congelada”)
+  try{
+    sh.getRange("B:B").setNumberFormat("MM/yyyy");
+    sh.getRange("C:C").setNumberFormat("dd/MM/yyyy");
+    sh.getRange("D:D").setNumberFormat("R$ #,##0.00");
+    sh.getRange("F:F").setNumberFormat("dd/MM/yyyy");
+    sh.getRange("H:J").setNumberFormat("R$ #,##0.00");
+    try{ sh.hideColumns(7); }catch(_){}
+    try{ sh.setFrozenRows(1); sh.setFrozenColumns(1); }catch(_){}
+  }catch(_){}
+
+  // DV Cartão (A2:A) — sempre reavalia a partir da Config
+  try{
+    const cfg=_getCfg_();
+    if(cfg){
+      const rows=_rangeCartoes_(cfg);
+      if(rows.length){
+        const map=_cfgMap_(cfg);
+        const cartoesRng=cfg.getRange(map.CARTOES_FIRST_ROW, map.CARTOES_FIRST_COL, rows.length, 1);
+        _applyDVRangeIfChanged_(sh.getRange("A2:A"), cartoesRng, false);
+      } else {
+        sh.getRange("A2:A").clearDataValidations();
+      }
+    }
+  }catch(_){}
+
+  // DV Status (E2:E)
+  try{
+    const statusList=["Pendente","Conciliado","Cancelado"];
+    _applyDVIfChanged_(sh.getRange("E2:E"), statusList, false);
+  }catch(_){}
+
+  _protectHeaderRow_(sh);
+  return sh;
+}
+
+/* ===================== Limites & Exposição ===================== */
+
+function _cardKeyFromName_(nome){
+  const s=String(nome||"").toLowerCase().trim();
+  const bytes=Utilities.computeDigest(Utilities.DigestAlgorithm.MD5,s);
+  const hex=bytes.map(b=>('0'+(b&0xFF).toString(16)).slice(-2)).join('').slice(0,6).toUpperCase();
+  return `CARD#${hex}`;
+}
+
+// opcional (use somente se adotar também na geração/CHAVE)
+function _cardKeyFromNameAndCycle_(nome, ini, fim, venc){
+  const s = `${String(nome||'').trim().toLowerCase()}|${ini}|${fim}|${venc}`;
+  const h = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, s, Utilities.Charset.UTF_8)
+    .map(b => (b+256).toString(16).slice(-2)).join('');
+  return 'CARD#' + h.slice(0,10);
+}
+
+function _limitePorCartao_(cfg){
+  const rows=_rangeCartoes_(cfg); const mapa=new Map();
+  rows.forEach(r=>{ const nome=String(r[0]||"").trim(); const limite=Number(r[4]||0); if(nome) mapa.set(nome, limite); });
+  return mapa;
+}
+
+function _exposicaoFuturaPorCartao_(shLanc, cfg, includeCurrent /*=false*/){
+  includeCurrent = Boolean(includeCurrent);
+  const last=shLanc.getLastRow(); const mapa=new Map(); if(last<4) return mapa;
+  const rows=shLanc.getRange(4, COL.DATA, last-3, (COL.VALOR_PARCELADO - COL.DATA + 1)).getValues();
+  const hoje=_today_(); const baseYear=hoje.getFullYear(), baseMonth=hoje.getMonth()+1;
+
+  for(let i=0;i<rows.length;i++){
+    const [data, , , , forma, parcelasRaw, valorRaw, valorParcRaw]=rows[i];
+    const dt=(data instanceof Date && !isNaN(data))?data:parseDateBR_(data); if(!dt) continue;
+
+    const cartRow=_findCartaoRow_(forma); if(!cartRow) continue;
+    const cartaoNome=String(cartRow[0]||"").trim();
+    const venc=_sanitizaDia_(cartRow[1]), ini=_sanitizaDia_(cartRow[2]), fim=_sanitizaDia_(cartRow[3]); if(venc==null||ini==null||fim==null) continue;
+
+    let n=parseInt(parcelasRaw,10); if(!isFinite(n)||n<=0) n=1;
+    const total=Number(valorRaw)||0; const parts=_parcelasExatas_(total, n);
+
+    for(let p=0;p<n;p++){
+      const dataParc=new Date(dt); dataParc.setMonth(dataParc.getMonth()+p);
+      const { mes:mFat, ano:aFat }=calcularCicloCartao(dataParc, ini, fim, venc);
+
+      const isFuture = (aFat>baseYear) || (aFat===baseYear && mFat>baseMonth);
+      const isCurrent= (aFat===baseYear && mFat===baseMonth);
+      if(!(isFuture || (includeCurrent && isCurrent))) continue;
+
+      const vParc = _parcelaOuFallback_(valorParcRaw, parts[p]);
+      if (_eqNum_(vParc, 0)) continue;
+      mapa.set(cartaoNome, (mapa.get(cartaoNome)||0)+vParc);
+    }
+  }
+  // Arredondamento consistente na fonte
+  for (const [k,v] of mapa.entries()) mapa.set(k, _r2(v));
+  return mapa;
+}
+
+function _exposicaoFuturaBuckets_(shLanc){
+  const last=shLanc.getLastRow();
+  const out={ d30:0, d90:0, d180:0, dInf:0 }; if(last<4) return out;
+  const rows=shLanc.getRange(4, COL.DATA, last-3, (COL.VALOR_PARCELADO - COL.DATA + 1)).getValues();
+  const hoje=_today_();
+
+  for(let i=0;i<rows.length;i++){
+    const [data, , , , forma, parcelasRaw, valorRaw, valorParcRaw]=rows[i];
+    const dt=(data instanceof Date && !isNaN(data))?data:parseDateBR_(data); if(!dt) continue;
+
+    const cartRow=_findCartaoRow_(forma); if(!cartRow) continue;
+    const venc=_sanitizaDia_(cartRow[1]), ini=_sanitizaDia_(cartRow[2]), fim=_sanitizaDia_(cartRow[3]);
+    if(venc==null||ini==null||fim==null) continue;
+
+    let n=parseInt(parcelasRaw,10); if(!isFinite(n)||n<=0) n=1;
+    const total=Number(valorRaw)||0; const parts=_parcelasExatas_(total, n);
+
+    for(let p=0;p<n;p++){
+      const dParc=new Date(dt); dParc.setMonth(dParc.getMonth()+p);
+      const info=calcularCicloCartao(dParc, ini, fim, venc);
+      const vencDate=info && (info.venc || info.vencDate);
+      if(!(vencDate instanceof Date) || isNaN(vencDate)) continue; // guarda: sem NaN
+
+      const v = _parcelaOuFallback_(valorParcRaw, parts[p]);
+      if (_eqNum_(v, 0)) continue;
+      const dias=Math.ceil((_dateOnly_(vencDate)-_dateOnly_(hoje))/(24*3600*1000));
+      if(dias<0) continue;
+      if(dias<=30) out.d30+=v;
+      else if(dias<=90) out.d90+=v;
+      else if(dias<=180) out.d180+=v;
+      else out.dInf+=v;
+    }
+  }
+  Object.keys(out).forEach(k=>out[k]=_r2(out[k]));
+  return out;
+}
+
+/* ===================== FATURAS (geração) ===================== */
+
+function gerarFaturasDeCartao_(useLock=true){
+  let lock;
+  if(useLock){
+    lock=LockService.getDocumentLock();
+    let ok=lock.tryLock(5000);
+    for(let i=0; !ok && i<2; i++){ Utilities.sleep(400); ok=lock.tryLock(5000); }
+    if(!ok){ _maybeToast_("⏳ Outro processo em andamento..."); return; }
+  }
+  try{
+    const tz=_tz_();
+    const shLanc=_getLanc_();
+    const shCfg =_getCfg_();
+    const shFat=_ensureFaturasHeaders_();
+    if(!shLanc||!shCfg||!shFat) return;
+
+    const cartoes=_rangeCartoes_(shCfg); if(!cartoes.length){ _maybeToast_("⚠️ Nenhum cartão em Configurações!"); return; }
+    const ultima=shLanc.getLastRow(); if(ultima<4){ _maybeToast_("ℹ️ Sem lançamentos para gerar faturas."); return; }
+
+    const rows=shLanc.getRange(4, COL.DATA, ultima-3, COL.STATUS - COL.DATA + 1).getValues(); // B..J
+    const mapa=new Map();
+    const errosCiclo=new Set();
+
+    function addToMap(cardKey, cartaoNome, mesRefDate, dtVenc, valor){
+      const chave=`${cardKey}||${Utilities.formatDate(mesRefDate, tz, "MM/yyyy")}`;
+      if(!mapa.has(chave)) mapa.set(chave, {cartaoNome, mesRef:mesRefDate, dtVenc, total:0});
+      const o=mapa.get(chave); o.total+=(Number(valor)||0);
+    }
+
+    for(let i=0;i<rows.length;i++){
+      const [data, , , , forma, parcelasRaw, valorRaw, valorParcRaw]=rows[i];
+      if(!data||!forma) continue;
+      const cartRow=_findCartaoRow_(forma); if(!cartRow) continue;
+      const cartaoNome=String(cartRow[0]||"").trim(); const cardKey=_cardKeyFromName_(cartaoNome);
+      const venc=_sanitizaDia_(cartRow[1]), ini=_sanitizaDia_(cartRow[2]), fim=_sanitizaDia_(cartRow[3]); if(venc==null||ini==null||fim==null){ errosCiclo.add(cartaoNome); continue; }
+      const dt=(data instanceof Date&&!isNaN(data))?data:parseDateBR_(data); if(!dt) continue;
+
+      let parcelas=parseInt(parcelasRaw,10); if(!isFinite(parcelas)||parcelas<=0) parcelas=1;
+      const total=Number(valorRaw)||0; const parts=_parcelasExatas_(total, parcelas);
+
+      for(let p=0;p<parcelas;p++){
+        const dataParc=new Date(dt); dataParc.setMonth(dataParc.getMonth()+p);
+        const { mes:mFat, ano:aFat, venc: vencDate }=calcularCicloCartao(dataParc, ini, fim, venc);
+        const mesRefDate=new Date(aFat, mFat-1, 1);
+        const vParc = _parcelaOuFallback_(valorParcRaw, parts[p]);
+        if (_eqNum_(vParc, 0)) continue;
+        addToMap(cardKey, cartaoNome, mesRefDate, vencDate, vParc);
+      }
+    }
+
+    const lastFat=shFat.getLastRow();
+    const existentes=(lastFat>=2)? shFat.getRange(2,7,lastFat-1,1).getValues().flat() : [];
+    const idx=new Map(); existentes.forEach((k,i)=>{ if(k) idx.set(k, i+2); });
+
+    let atualizados=0; const toInsert=[];
+    for(const [chave, o] of mapa.entries()){
+      const r=idx.get(chave);
+      const linha=[o.cartaoNome, o.mesRef, o.dtVenc, _r2(o.total), "", "", chave, "", "", "", ""];
+      if(r){
+        const cur=shFat.getRange(r,1,1,linha.length).getValues()[0];
+        linha[4]=cur[4]||linha[4];
+        linha[5]=cur[5]||linha[5];
+        linha[7]=cur[7]||linha[7];
+        linha[8]=cur[8]||linha[8];
+        linha[9]=cur[9]||linha[9];
+        linha[10]=cur[10]||linha[10];
+
+        const igual= _sameDate_(cur[1], linha[1]) && _sameDate_(cur[2], linha[2]) &&
+                     _eqNum_(cur[3], linha[3]) && String(cur[6]||"")==linha[6];
+        if(!igual){
+          shFat.getRange(r,1,1,linha.length).setValues([linha]);
+          try{
+            shFat.getRange(r,2).setNumberFormat("MM/yyyy");
+            shFat.getRange(r,3).setNumberFormat("dd/MM/yyyy");
+            shFat.getRange(r,4).setNumberFormat("R$ #,##0.00");
+          }catch(_){ }
+          atualizados++;
+        }
+      } else {
+        toInsert.push(linha);
+      }
+    }
+    if(toInsert.length){
+      const start=shFat.getLastRow()+1;
+      shFat.getRange(start, 1, toInsert.length, 11).setValues(toInsert);
+      try{
+        shFat.getRange(start,2,toInsert.length,1).setNumberFormat("MM/yyyy");
+        shFat.getRange(start,3,toInsert.length,1).setNumberFormat("dd/MM/yyyy");
+        shFat.getRange(start,4,toInsert.length,1).setNumberFormat("R$ #,##0.00");
+      }catch(_){ }
+    }
+
+    try{
+      const keysAtuais=new Set(mapa.keys()); const aExcluir=[];
+      idx.forEach((row, key)=>{ if(!keysAtuais.has(key)) aExcluir.push(row); });
+      aExcluir.sort((a,b)=>b-a).forEach(r=>shFat.deleteRow(r));
+    }catch(_){}
+
+    try{
+      const n=shFat.getLastRow();
+      if(n>1) shFat.getRange(2,1,n-1,11).sort([{column:1, ascending:true}, {column:2, ascending:true}, {column:3, ascending:true}]);
+    }catch(_){}
+
+    if(errosCiclo.size){
+      const nomes=Array.from(errosCiclo); const max=8; const msg=nomes.length>max?`${nomes.slice(0,max).join(', ')} +${nomes.length-max}`:nomes.join(', ');
+      _maybeToast_(`⚠️ Ciclo inválido: ${msg} (confira venc/início/fim).`);
+    }
+
+    try{ _protectHeaderRow_(_ensureFaturasHeaders_()); }catch(_){}
+
+    _maybeToast_(`✅ Faturas atualizadas. +${toInsert.length} inseridas / ${atualizados} atualizadas`);
+  }catch(e){ _maybeToast_("⚠️ Erro em gerarFaturasDeCartao_: "+(e&&e.message?e.message:e)); }
+  finally{ try{ if(useLock && lock) lock.releaseLock(); }catch(_){ } }
+}
+
+/* ===================== RESUMO (pagamento parcial) ===================== */
+
+// Normaliza Coluna B (Mês) para Date antes de ordenar
+function normalizeResumoMesColB_(shRes){
+  const last=shRes.getLastRow(); if(last<2) return;
+  const rg  = shRes.getRange(2,2,last-1,1);
+  const vals= rg.getValues();
+  for(let i=0;i<vals.length;i++){
+    const c=vals[i][0];
+    if(c instanceof Date && !isNaN(c)) continue;
+    const s=String(c||'').trim();
+    if(/^\d{2}\/\d{4}$/.test(s)){
+      const [mm,yyyy]=s.split('/').map(Number);
+      vals[i][0]=new Date(yyyy, mm-1, 1);
+    } else if (s){
+      const p=parseDateBR_(s);
+      if(p) vals[i][0]=new Date(p.getFullYear(), p.getMonth(), 1);
+    }
+  }
+  rg.setValues(vals);
+  try{ rg.setNumberFormat('MM/yyyy'); }catch(_){}
+}
+
+function atualizarResumoFaturas_(useLock=true){
+  let lock;
+  if(useLock){
+    lock=LockService.getDocumentLock();
+    let ok=lock.tryLock(5000);
+    for(let i=0; !ok && i<2; i++){ Utilities.sleep(400); ok=lock.tryLock(5000); }
+    if(!ok){ _maybeToast_("⏳ Outro processo em andamento..."); return; }
+  }
+  try{
+    const tz=_tz_();
+    const shFat=_ensureFaturasHeaders_(), shRes=_ensureResumoHeaders_();
+    if(!shFat||!shRes){ _maybeToast_("❌ Abas não encontradas."); return; }
+
+    const last=shFat.getLastRow();
+    const dados=(last>=2)? shFat.getRange(2,1,last-1,11).getValues() : [];
+
+    // agrega por CHAVE (cartão+mês)
+    const mapa=new Map();
+    for(const r of dados){
+      const cartao=String(r[0]||"").trim();
+      const mesCell=r[1];
+      const mesDate=(mesCell instanceof Date&&!isNaN(mesCell))? new Date(mesCell.getFullYear(), mesCell.getMonth(),1):null;
+      const mesStr=mesDate? Utilities.formatDate(mesDate, tz, "MM/yyyy") : String(mesCell||"").trim();
+      const valFatura=Number(r[3]||0);
+      const status=String(r[4]||"").trim();
+      const dtPag=r[5];
+      const chave=String(r[6]||"").trim();
+      const valPago=Number(r[7]||0);
+      const encargos=Number(r[8]||0);
+      const creditos=Number(r[9]||0);
+
+      if(!(cartao && mesStr)) continue;
+      const k=chave || `${_cardKeyFromName_(cartao)}||${mesStr}`;
+      if(!mapa.has(k)) mapa.set(k, { cartao, mesStr, mesDate, total:0, pagos:0, encargos:0, creditos:0, lastStatus:"", lastPaidAt:null });
+
+      const o=mapa.get(k);
+      o.total    += valFatura;
+      o.pagos    += Math.max(valPago,0);
+      o.encargos += Math.max(encargos,0);
+      o.creditos += Math.max(creditos,0);
+
+      if(status){
+        const paidAt = (dtPag instanceof Date && !isNaN(dtPag)) ? dtPag : null;
+        if(!o.lastPaidAt || (paidAt && paidAt > o.lastPaidAt)){
+          o.lastStatus = status;
+          o.lastPaidAt = paidAt;
+        }
+        if (_isConciliadoStatus_(status) && !paidAt && !o.lastPaidAt){
+          o.lastStatus = status;
+        }
+      }
+    }
+
+    // limites/exposição
+    const cfg=_getCfg_();
+    const limites=_limitePorCartao_(cfg);
+    const shLanc=_getLanc_();
+    const expoFutura=_exposicaoFuturaPorCartao_(shLanc, cfg /* includeCurrent=false */);
+
+    // Comparador com tolerância (~0,05 p.p.)
+    const utilEq = (a,b) => {
+      const na = (a===''||a==null) ? null : Number(a);
+      const nb = (b===''||b==null) ? null : Number(b);
+      if (na==null && nb==null) return true;
+      if (na==null || nb==null) return false;
+      return Math.abs(na - nb) <= 0.0005;
+    };
+
+    const lastRes=shRes.getLastRow();
+    const existentes=(lastRes>=2)? shRes.getRange(2,7,lastRes-1,1).getValues().flat() : [];
+    const idxPorChave=new Map(); existentes.forEach((ch,i)=>{ if(ch) idxPorChave.set(ch, i+2); });
+
+    const toInsert=[];
+    for(const [key, o] of mapa.entries()){
+      const limite=Number(limites.get(o.cartao)||0);
+      const liquido = _r2( (o.total + o.encargos - o.creditos) );
+      const pendente= _r2( Math.max(liquido - o.pagos, 0) );
+      const conciliado=_r2( Math.min(o.pagos, liquido) );
+      const utilizacao=(limite>0)? (liquido/limite) : null;
+      const expo=_r2(Number(expoFutura.get(o.cartao)||0));
+
+      const mesDateFinal=o.mesDate || (function(){ const m=o.mesStr.split('/'); if(m.length===2){ const mm=+m[0], yyyy=+m[1]; return new Date(yyyy, mm-1, 1); } return null; })();
+      const linha=[ o.cartao, mesDateFinal, liquido, pendente, conciliado, o.lastStatus||"", key, utilizacao, expo ];
+      const row=idxPorChave.get(key);
+      if(row){
+        const atual=shRes.getRange(row,1,1,9).getValues()[0];
+        const statusAtual=String(atual[5]||"");
+        const finalStatus=_isConciliadoStatus_(statusAtual)?statusAtual:(o.lastStatus||"");
+        const igual=(String(atual[0]||"")==linha[0]) && _sameDate_(atual[1],linha[1]) &&
+          _eqNum_(atual[2],linha[2]) && _eqNum_(atual[3],linha[3]) && _eqNum_(atual[4],linha[4]) &&
+          (String(statusAtual)==finalStatus) && (String(atual[6]||"")==linha[6]) &&
+          utilEq(atual[7], linha[7]) && _eqNum_(atual[8],linha[8]);
+        if(!igual){
+          linha[5]=finalStatus;
+          shRes.getRange(row,1,1,9).setValues([linha]);
+          try{
+            shRes.getRange(row,2).setNumberFormat("MM/yyyy");
+            shRes.getRange(row,3).setNumberFormat("R$ #,##0.00");
+            shRes.getRange(row,4).setNumberFormat("R$ #,##0.00");
+            shRes.getRange(row,5).setNumberFormat("R$ #,##0.00");
+            shRes.getRange(row,8).setNumberFormat("0.00%");
+            shRes.getRange(row,9).setNumberFormat("R$ #,##0.00");
+          }catch(_){ }
+        }
+      } else toInsert.push(linha);
+    }
+    if(toInsert.length){
+      const start=shRes.getLastRow()+1;
+      shRes.getRange(start, 1, toInsert.length, 9).setValues(toInsert);
+      try{
+        shRes.getRange(start,2,toInsert.length,1).setNumberFormat("MM/yyyy");
+        shRes.getRange(start,3,toInsert.length,1).setNumberFormat("R$ #,##0.00");
+        shRes.getRange(start,4,toInsert.length,1).setNumberFormat("R$ #,##0.00");
+        shRes.getRange(start,5,toInsert.length,1).setNumberFormat("R$ #,##0.00");
+        shRes.getRange(start,8,toInsert.length,1).setNumberFormat("0.00%");
+        shRes.getRange(start,9,toInsert.length,1).setNumberFormat("R$ #,##0.00");
+      }catch(_){ }
+    }
+
+    // Normaliza Mês (B) para Date e só então ordena
+    normalizeResumoMesColB_(shRes);
+
+    // Remoção de obsoletos + Ordenação
+    try{
+      const keysAtuais=new Set(mapa.keys()); const aExcluir=[];
+      for(const [k,row] of idxPorChave.entries()){ if(!keysAtuais.has(k)) aExcluir.push(row); }
+      aExcluir.sort((a,b)=>b-a).forEach(r=>shRes.deleteRow(r));
+    }catch(_){ }
+    try{
+      const n=shRes.getLastRow(); if(n>1) shRes.getRange(2,1,n-1,9)
+        .sort([{column:1, ascending:true}, {column:2, ascending:true}]);
+    }catch(_){ }
+
+    try{ _protectHeaderRow_(_ensureResumoHeaders_()); }catch(_){}
+    _maybeToast_(`✅ Resumo de Faturas atualizado (${mapa.size} grupo(s)).`);
+    try{ ensureCondFormatResumoUtil_(); }catch(_){}
+    try{ alertasUtilizacaoEExposicao_(); }catch(_){}
+  }catch(err){ _maybeToast_("⚠️ Erro: "+(err&&err.message?err.message:err)); }
+  finally{ try{ if(useLock && lock) lock.releaseLock(); }catch(_){ } }
+}
+
+/***************************************************************
+ * [2B] PREVISÃO / ORÇAMENTO / PROJEÇÕES / AUDITORIAS
+ ***************************************************************/
+
+const MAX_ITENS_PREV = 211;
+
+function _dedupCaseAccent_(arr){
+  const seen=new Set(); const out=[];
+  for(const s of (arr||[])){
+    const k=_normLower_(s);
+    if(k && !seen.has(k)){ seen.add(k); out.push(s); }
+  }
+  return out;
+}
+
+function preencherPrevisaoDeGastos(){
+  const cfg=_getCfg_(), prev=getSheetSmart_(ABAS.PREVISAO_GASTOS, ['Previsao de Gastos']);
+  if(!cfg||!prev) return;
+
+  const last=_cfgLastRow_(cfg);
+  const detalhamentos = cfg.getRange(3,5,last-2,1).getValues().flat().filter(String);
+  const subcategorias  = cfg.getRange(3,2,last-2,1).getValues().flat().filter(String);
+  const subcatsComDet  = cfg.getRange(3,6,last-2,1).getValues().flat().filter(String);
+  const subcatsSemDet  = subcategorias.filter(s => !detalhamentos.includes(s) && !subcatsComDet.includes(s));
+
+  const listaFinal=_dedupCaseAccent_([...detalhamentos, ...subcatsSemDet]).slice(0, MAX_ITENS_PREV);
+
+  const start=2, max=MAX_ITENS_PREV, n=listaFinal.length;
+  if (n) prev.getRange(start,1,n,1).setValues(listaFinal.map(x=>[x]));
+  if (n<max) prev.getRange(start+n,1,max-n,1).clearContent();
+}
+
+function preencherColunaB(){
+  const prev = getSheetSmart_(ABAS.PREVISAO_GASTOS, ['Previsao de Gastos']);
+  const lanc = _getLanc_();
+  const cfg  = _getCfg_();
+  if (!prev || !lanc || !cfg) return;
+
+  const anoRef   = getAnoRef_(cfg) || (new Date()).getFullYear();
+  const compMode = getCompMode_(cfg); // 'CAIXA' | 'CONSUMO'
+
+  // Itens (A2:A)
+  const lastPrev = Math.max(prev.getLastRow(), 2);
+  const itens    = prev.getRange(2,1,lastPrev-1,1).getValues().flat().map(s => String(s||'').trim());
+  if (!itens.length){
+    try { prev.getRange('B2:B').clearContent(); } catch(_) {}
+    return;
+  }
+
+  // --- Normalização unificada de Detalhamentos oficiais ---
+  const lastCfg = _cfgLastRow_(cfg);
+  const detOfRaw = (lastCfg>2 ? cfg.getRange(3,5,lastCfg-2,1).getValues() : []).flat().filter(Boolean);
+  const detsOficiaisNorm = new Set(detOfRaw.map(x => _normLower_(_stripDiacritics_(String(x)))));
+  const norm = s => _normLower_(_stripDiacritics_(String(s||'')));
+
+  // Soma por item em CENTAVOS
+  const somaCents = new Map();
+  const addC = (item, cents) => {
+    const k = String(item||'').trim();
+    if (!k || !(Number(cents)>0)) return;
+    somaCents.set(k, (somaCents.get(k)||0) + Number(cents));
+  };
+
+  const lastLanc = lanc.getLastRow();
+  if (lastLanc >= 4){
+    const rows = lanc.getRange(4, COL.DATA, lastLanc-3, (COL.VALOR_PARCELADO - COL.DATA + 1)).getValues();
+    for (const r of rows){
+      const [dataRaw, sub, det, , forma, parcelasRaw, valorRaw, valorParcRaw] = r;
+
+      const detStr = String(det||'').trim();
+      const subStr = String(sub||'').trim();
+      const item   = detsOficiaisNorm.has(norm(detStr)) ? detStr : subStr;
+      if (!item) continue;
+
+      const dt = (dataRaw instanceof Date && !isNaN(dataRaw)) ? dataRaw : parseDateBR_(dataRaw);
+      if (!dt) continue;
+
+      // valores em centavos
+      const totalCents = toCents_(valorRaw);
+      const parcCents  = toCents_(valorParcRaw);
+      let n = parseInt(parcelasRaw, 10); if (!isFinite(n) || n <= 0) n = 1;
+
+      if (compMode === 'CONSUMO'){
+        if (dt.getFullYear() === anoRef && totalCents > 0) addC(item, totalCents);
+        continue;
+      }
+
+      // CAIXA
+      const cartRow = _findCartaoRow_(forma);
+      if (!cartRow){
+        // --- Modelo B não-cartão: VALOR=0 e VALOR_PARCELADO>0 → soma n*parcela no próprio ano ---
+        if (dt.getFullYear() === anoRef){
+          if (totalCents === 0 && parcCents !== 0){
+            addC(item, parcCents * n);
+          } else if (totalCents > 0){
+            addC(item, totalCents);
+          }
+        }
+        continue;
+      }
+
+      // Cartão
+      const venc = _sanitizaDia_(cartRow[1]),
+            ini  = _sanitizaDia_(cartRow[2]),
+            fim  = _sanitizaDia_(cartRow[3]);
+
+      if (venc==null || ini==null || fim==null){
+        if (dt.getFullYear() === anoRef && totalCents > 0) addC(item, totalCents);
+        continue;
+      }
+
+      // monta parcelas exatas em centavos
+      const base  = Math.floor((totalCents>0?totalCents:0) / n);
+      const resto = (totalCents>0?totalCents:0) - base*n;
+      const partsCents = Array.from({length:n}, (_,i)=> base + (i<resto ? 1 : 0));
+
+      for (let p=0; p<n; p++){
+        const dParc = new Date(dt); dParc.setMonth(dParc.getMonth() + p);
+        const { mes, ano } = calcularCicloCartao(dParc, ini, fim, venc);
+        if (ano !== anoRef) continue;
+
+        // prioriza valorParcRaw quando existir
+        let vParcCents = (parcCents!==0 && parcCents!=null) ? parcCents : partsCents[p];
+        if (vParcCents > 0) addC(item, vParcCents);
+      }
+    }
+  }
+
+  // Escreve B2:B
+  const out = itens.map(it => [ _r2(fromCents_(somaCents.get(String(it||'').trim()) || 0)) ]);
+  const destino = prev.getRange(2,2,out.length,1);
+  destino.setValues(out);
+  try { destino.setNumberFormat('R$ #,##0.00'); } catch(_) {}
+}
+
+/* ========= Estrutura da aba PREVISÃO (garante criação + formatos) ========= */
+function ensureOrcamentoEstrutura_(){
+  const sh = _safeEnsureSheet_(ABAS.PREVISAO_GASTOS, ['Previsao de Gastos']);
+  if (!sh) return;
+
+  const desired = [
+    'Categoria',            // A
+    'Acum. Ano (R$)',       // B
+    'Meta Mês (R$)',        // C
+    'Saldo Anual (R$)',     // D
+    'Desvio Anual (%)',     // E
+    'Desvio Mês (%)',       // F
+    'Prioridade',           // G
+    'Barra Mês',            // H
+    'Restante Mês (%)',     // I
+    'Consumido Mês (%)',    // J
+    'Status Mês'            // K
+  ];
+
+  const hdrRange = sh.getRange(1,1,1,desired.length);
+  const cur = hdrRange.getValues()[0].map(v=>String(v||'').trim());
+  let needsRename = false;
+  for (let i=0;i<desired.length;i++){ if(cur[i] !== desired[i]){ needsRename = true; break; } }
+  if (needsRename){ sh.getRange(1,1,1,desired.length).setValues([desired]); }
+
+  try {
+    sh.setFrozenRows(1);
+    sh.getRange('B:B').setNumberFormat('R$ #,##0.00');
+    sh.getRange('C:C').setNumberFormat('R$ #,##0.00');
+    sh.getRange('D:D').setNumberFormat('R$ #,##0.00');
+    sh.getRange('E:E').setNumberFormat('0.00%');
+    sh.getRange('F:F').setNumberFormat('0.00%');
+    sh.getRange('I:I').setNumberFormat('0.00%');
+    sh.getRange('J:J').setNumberFormat('0.00%');
+  } catch(_){}
+}
+
+/* ========= Metas / variações / indicadores ========= */
+
+function _preencherMetaMensalAuto_({overwrite=false}={}) {
+  // tenta Projeções centralizadas
+  try { preverProximosMeses_(6, 'median'); } catch (_) {}
+
+  try {
+    metasUsarProjecaoSmart_({ overwrite });
+    return;
+  } catch (_) {}
+
+  const prev = getSheetSmart_(ABAS.PREVISAO_GASTOS, ['Previsao de Gastos']);
+  const lanc = _getLanc_(), cfg = _getCfg_(); if (!prev || !lanc || !cfg) return;
+
+  const lastPrev = prev.getLastRow(); if (lastPrev < 2) return;
+  const itens = prev.getRange(2,1,lastPrev-1,1).getValues().flat();
+
+  const today=_today_(), tz=_tz_();
+  const mesesAlvo=[1,2,3].map(k=>new Date(today.getFullYear(), today.getMonth()-k, 1));
+  const key=(d)=>Utilities.formatDate(new Date(d.getFullYear(), d.getMonth(),1), tz, 'MM/yyyy');
+
+  // Normalização unificada de Detalhamentos oficiais (case/acento)
+  const lastCfg = _cfgLastRow_(cfg);
+  const detOfRaw = (lastCfg>2 ? cfg.getRange(3,5,lastCfg-2,1).getValues() : []).flat().filter(Boolean);
+  const detsOfNorm = new Set(detOfRaw.map(x => _normLower_(_stripDiacritics_(String(x)))));
+  const norm = s => _normLower_(_stripDiacritics_(String(s||'')));
+
+  const somaPorItemMes=new Map();
+  const lastLanc=lanc.getLastRow();
+  if (lastLanc >= 4) {
+    const rows = lanc.getRange(4, COL.DATA, lastLanc-3, (COL.VALOR_PARCELADO - COL.DATA + 1)).getValues();
+    const compMode=getCompMode_(cfg);
+
+    for (const r of rows) {
+      const [dataRaw, sub, det, , forma, parcelasRaw, valorRaw, valorParcRaw] = r;
+
+      const detStr = String(det||'').trim();
+      const subStr = String(sub||'').trim();
+      const item   = detsOfNorm.has(norm(detStr)) ? detStr : subStr;
+      if (!item) continue;
+
+      const dt=(dataRaw instanceof Date && !isNaN(dataRaw)) ? dataRaw : parseDateBR_(dataRaw); if (!dt) continue;
+
+      if (compMode === 'CONSUMO') {
+        const k=key(dt);
+        if (mesesAlvo.some(m=>key(m)===k)) {
+          const tot=Number(valorRaw)||0;
+          if (tot>0) {
+            const kk=item+'|'+k;
+            somaPorItemMes.set(kk,(somaPorItemMes.get(kk)||0)+tot);
+          }
+        }
+        continue;
+      }
+
+      // CAIXA
+      const cartRow=_findCartaoRow_(forma);
+      let n=parseInt(parcelasRaw,10); if(!isFinite(n)||n<=0) n=1;
+      const total=Number(valorRaw)||0; const parts=_parcelasExatas_(total, n);
+
+      if (!cartRow) {
+        // Modelo B não-cartão: VALOR=0 e VALOR_PARCELADO>0 → soma n*parcela
+        const k=key(dt);
+        if (mesesAlvo.some(m=>key(m)===k)) {
+          const parc = Number(valorParcRaw)||0;
+          const addVal = (total===0 && parc!==0) ? (parc*n) : total;
+          if (addVal>0) {
+            const kk=item+'|'+k;
+            somaPorItemMes.set(kk,(somaPorItemMes.get(kk)||0)+addVal);
+          }
+        }
+      } else {
+        const venc=_sanitizaDia_(cartRow[1]), ini=_sanitizaDia_(cartRow[2]), fim=_sanitizaDia_(cartRow[3]);
+        if (venc!=null && ini!=null && fim!=null) {
+          for (let p=0;p<n;p++) {
+            const dParc=new Date(dt); dParc.setMonth(dParc.getMonth()+p);
+            const {mes,ano}=calcularCicloCartao(dParc, ini, fim, venc);
+            const ref=new Date(ano, mes-1, 1);
+            const k=key(ref);
+            if (mesesAlvo.some(m=>key(m)===k)) {
+              const v = _parcelaOuFallback_(valorParcRaw, parts[p]);
+              if (_eqNum_(v, 0)) continue;
+              const kk=item+'|'+k;
+              somaPorItemMes.set(kk,(somaPorItemMes.get(kk)||0)+v);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Mediana dos 3 meses-alvo por item
+  const metas = itens.map(item=>{
+    const vals = mesesAlvo.map(m=>somaPorItemMes.get(item+'|'+key(m))||0).filter(v=>v>0);
+    if(!vals.length) return [0];
+    const sorted=vals.slice().sort((a,b)=>a-b);
+    const mid=Math.floor(sorted.length/2);
+    const med = sorted.length%2 ? sorted[mid] : (sorted[mid-1]+sorted[mid])/2;
+    return [_r2(med)];
+  });
+
+  prev.getRange(2,3,metas.length,1).setValues(metas);
+  try { prev.getRange(2,3,metas.length,1).setNumberFormat('R$ #,##0.00'); } catch(_){}
+}
+
+function _preencherColunaF_(){
+  const prev=getSheetSmart_(ABAS.PREVISAO_GASTOS, ['Previsao de Gastos']);
+  const lanc=_getLanc_(), cfg=_getCfg_(); if(!prev||!lanc||!cfg) return;
+
+  const lastPrev=prev.getLastRow(); if(lastPrev<2) return;
+  const itens=prev.getRange(2,1,lastPrev-1,1).getValues().flat();
+  const metas=prev.getRange(2,3,lastPrev-1,1).getValues().flat().map(Number);
+
+  const today=_today_(), tz=_tz_();
+  const alvoKey=Utilities.formatDate(new Date(today.getFullYear(), today.getMonth(), 1), tz, 'MM/yyyy');
+
+  // --- Normalização unificada de Detalhamentos oficiais ---
+  const lastCfg=_cfgLastRow_(cfg);
+  const detOfRaw = (lastCfg>2 ? cfg.getRange(3,5,lastCfg-2,1).getValues() : []).flat().filter(Boolean);
+  const detsOficiaisNorm = new Set(detOfRaw.map(x => _normLower_(_stripDiacritics_(String(x)))));
+  const norm = s => _normLower_(_stripDiacritics_(String(s||'')));
+
+  const sumMes=new Map();
+  const lastLanc=lanc.getLastRow();
+  if(lastLanc>=4){
+    const rows=lanc.getRange(4, COL.DATA, lastLanc-3, (COL.VALOR_PARCELADO - COL.DATA + 1)).getValues();
+    const compMode=getCompMode_(cfg);
+
+    for(const r of rows){
+      const [dataRaw, sub, det, , forma, parcelasRaw, valorRaw, valorParcRaw]=r;
+
+      const detStr = String(det||'').trim();
+      const subStr = String(sub||'').trim();
+      const item   = detsOficiaisNorm.has(norm(detStr)) ? detStr : subStr;
+      if(!item) continue;
+
+      const dt=(dataRaw instanceof Date&&!isNaN(dataRaw))?dataRaw:parseDateBR_(dataRaw); if(!dt) continue;
+
+      if(compMode==='CONSUMO'){
+        const k=Utilities.formatDate(new Date(dt.getFullYear(),dt.getMonth(),1), tz, 'MM/yyyy');
+        if(k===alvoKey){
+          const tot=Number(valorRaw)||0; if(tot>0) sumMes.set(item,(sumMes.get(item)||0)+tot);
+        }
+      } else {
+        const cartRow=_findCartaoRow_(forma);
+        let n=parseInt(parcelasRaw,10); if(!isFinite(n)||n<=0) n=1;
+
+        if(!cartRow){
+          // --- Modelo B não-cartão: VALOR=0 e VALOR_PARCELADO>0 → soma n*parcela no mês-alvo ---
+          const k=Utilities.formatDate(new Date(dt.getFullYear(),dt.getMonth(),1), tz, 'MM/yyyy');
+          if(k===alvoKey){
+            const total=Number(valorRaw)||0;
+            const parc = Number(valorParcRaw)||0;
+            if (total===0 && parc!==0){
+              sumMes.set(item,(sumMes.get(item)||0) + (parc*n));
+            } else if (total>0){
+              sumMes.set(item,(sumMes.get(item)||0) + total);
+            }
+          }
+        } else {
+          const venc=_sanitizaDia_(cartRow[1]), ini=_sanitizaDia_(cartRow[2]), fim=_sanitizaDia_(cartRow[3]);
+          if(venc!=null&&ini!=null&&fim!=null){
+            const total=Number(valorRaw)||0;
+            const base  = Math.floor(total / n);
+            const resto = total - base*n;
+            const parts = Array.from({length:n}, (_,i)=> base + (i<resto ? 1 : 0));
+
+            for(let p=0;p<n;p++){
+              const dParc=new Date(dt); dParc.setMonth(dParc.getMonth()+p);
+              const {mes,ano}=calcularCicloCartao(dParc, ini, fim, venc);
+              const k=Utilities.formatDate(new Date(ano,mes-1,1), tz, 'MM/yyyy');
+              if(k===alvoKey){
+                const v = _parcelaOuFallback_(valorParcRaw, parts[p]);
+                if (_eqNum_(v, 0)) continue;
+                sumMes.set(item,(sumMes.get(item)||0)+v);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  const out = itens.map((it, i)=>{
+    const meta=Number(metas[i]||0);
+    const gasto=Number(sumMes.get(String(it||'').trim())||0);
+    if(!(meta>0)) return [""];
+    return [ (gasto/meta)-1 ];
+  });
+
+  prev.getRange(2,6,out.length,1).setValues(out);
+  try{ prev.getRange(2,6,out.length,1).setNumberFormat('0.00%'); }catch(_){}
+}
+
+function _preencherIndicadorG_(){
+  const sh=getSheetSmart_(ABAS.PREVISAO_GASTOS, ['Previsao de Gastos']); if(!sh) return;
+  const last=sh.getLastRow(); if(last<2) return;
+  const varYTD = sh.getRange(2,5,last-1,1).getValues().flat().map(Number); // E
+  const varMes = sh.getRange(2,6,last-1,1).getValues().flat().map(Number); // F
+
+  const rot = (ytd, mes)=>{
+    if(Number(mes)>0.15 || Number(ytd)>0.10) return 'Alta';
+    if(Number(mes)>0.00 || Number(ytd)>0.00) return 'Média';
+    return 'Baixa';
+  };
+  const out = varYTD.map((y,i)=>[ rot(y, varMes[i]) ]);
+  sh.getRange(2,7,out.length,1).setValues(out);
+}
+
+function atualizarPrevisaoCompleta_({overwriteMetas=false}={}){
+  ensureOrcamentoEstrutura_();   // A..G cabeçalho/formatos
+  preencherPrevisaoDeGastos();   // A
+  preencherColunaB();            // B (YTD por Item)
+  _preencherMetaMensalAuto_({overwrite: overwriteMetas}); // C (de Projeções)
+  atualizarOrcamentoVariacao_(); // D e E (usa B e C)
+  _preencherColunaF_();          // F (% mês vs meta)
+  _preencherIndicadorG_();       // G (Baixa/Média/Alta)
+  _maybeToast_('✅ Previsão (A:G) atualizada.');
+}
+
+function atualizarOrcamentoVariacao_(){
+  const sh=getSheetSmart_(ABAS.PREVISAO_GASTOS, ['Previsao de Gastos']); if(!sh) return;
+  const last=sh.getLastRow(); if(last<2) return;
+  const realizado=sh.getRange(2,2,last-1,1).getValues().flat().map(Number);
+  const metaMensal=sh.getRange(2,3,last-1,1).getValues().flat().map(Number);
+  const varR=[], varP=[];
+  for(let i=0;i<realizado.length;i++){
+    const real=Number(realizado[i])||0, meta=Number(metaMensal[i])||0, metaAno=meta*12, d=real-metaAno;
+    varR.push([_r2(d)]); varP.push([metaAno>0?((real/metaAno)-1):""]);
+  }
+  const rgR=sh.getRange(2,4,varR.length,1), rgP=sh.getRange(2,5,varP.length,1);
+  rgR.setValues(varR); rgP.setValues(varP);
+  try{ rgR.setNumberFormat('R$ #,##0.00'); rgP.setNumberFormat('0.00%'); }catch(_){}
+}
+
+/* ===================== PROJEÇÕES (median/winsor) ===================== */
+
+function _median_(arr){
+  const v=arr.slice().sort((a,b)=>a-b); const n=v.length;
+  if(!n) return 0;
+  const mid=Math.floor(n/2);
+  return n%2? v[mid] : (v[mid-1]+v[mid])/2;
+}
+
+function preverProximosMeses_(nMeses, metodo){
+  nMeses=Math.max(1, parseInt(nMeses,10)||3);
+  metodo=String(metodo||'median').toLowerCase(); // 'mean' | 'median'
+
+  const lanc=_getLanc_(), cfg=_getCfg_();
+  if(!lanc||!cfg) return;
+
+  const compMode=getCompMode_(cfg);
+  const hoje=_today_(), tz=_tz_(), last=lanc.getLastRow();
+  if(last<4) return;
+
+  const rows=lanc.getRange(4, COL.DATA, last-3, (COL.COMPETENCIA - COL.DATA + 1)).getValues();
+
+  const soma=new Map();
+  const mesKey=(d)=>Utilities.formatDate(new Date(d.getFullYear(), d.getMonth(), 1), tz, 'MM/yyyy');
+  function add(k,v){ if(k && v>0) soma.set(k,(soma.get(k)||0)+Number(v)); }
+
+  const mesCorrente=new Date(hoje.getFullYear(), hoje.getMonth(), 1).getTime();
+
+  for(let i=0;i<rows.length;i++){
+    const [dataRaw, subRaw, , , forma, parcelasRaw, valorRaw, valorParcRaw, /*status*/, compStr]=rows[i];
+    const sub=String(subRaw||'').trim(); if(!sub) continue;
+    const isCartao=ehCartao_(forma);
+
+    if (compMode==='CAIXA'){
+      if (isCartao){
+        const d=(dataRaw instanceof Date&&!isNaN(dataRaw))?dataRaw:parseDateBR_(dataRaw); if(!d) continue;
+        let n=parseInt(parcelasRaw,10); if(!isFinite(n)||n<=0) n=1;
+        const total=Number(valorRaw)||0; const parts=_parcelasExatas_(total, n);
+        const cartRow=_findCartaoRow_(forma); if(!cartRow) continue;
+        const venc=_sanitizaDia_(cartRow[1]), ini=_sanitizaDia_(cartRow[2]), fim=_sanitizaDia_(cartRow[3]); if(venc==null||ini==null||fim==null) continue;
+
+        for(let p=0;p<n;p++){
+          const dataParc=new Date(d); dataParc.setMonth(dataParc.getMonth()+p);
+          const { mes:mFat, ano:aFat }=calcularCicloCartao(dataParc, ini, fim, venc);
+          const base=new Date(aFat, mFat-1, 1); if(base.getTime()>=mesCorrente) continue;
+          const valor=_parcelaOuFallback_(valorParcRaw, parts[p]);
+          if (_eqNum_(valor, 0)) continue;
+          add(sub+'|'+mesKey(base), valor);
+        }
+      } else {
+        // NÃO-CARTÃO: prioriza DATA; cai para COMPETÊNCIA se não houver data (modelo B coberto)
+        let d=(dataRaw instanceof Date && !isNaN(dataRaw)) ? dataRaw : parseDateBR_(dataRaw);
+        let baseDate;
+        if(d && !isNaN(d)){
+          baseDate = new Date(d.getFullYear(), d.getMonth(), 1);
+        } else if (typeof compStr==='string' && /^\d{2}\/\d{4}$/.test(compStr)){
+          const [mm,yyyy]=String(compStr).split('/').map(Number); baseDate=new Date(yyyy, mm-1, 1);
+        } else if (compStr instanceof Date && !isNaN(compStr)){
+          baseDate=new Date(compStr.getFullYear(), compStr.getMonth(), 1);
+        } else { continue; }
+        if(baseDate.getTime()>=mesCorrente) continue;
+
+        const totalCents = toCents_(valorRaw);
+        const parcCents  = toCents_(valorParcRaw);
+        let n = parseInt(parcelasRaw,10); if(!isFinite(n)||n<=0) n=1;
+
+        if (totalCents === 0 && parcCents !== 0){
+          // Modelo B: parcelado fora do cartão — soma n*valorParc no mês histórico
+          const somaCents = parcCents * n;
+          add(sub + '|' + mesKey(baseDate), fromCents_(somaCents));
+        } else {
+          const valorApurar = Number(valorRaw)||0;
+          if (valorApurar > 0) add(sub + '|' + mesKey(baseDate), valorApurar);
+        }
+      }
+    } else {
+      // CONSUMO
+      const d=(dataRaw instanceof Date&&!isNaN(dataRaw))?dataRaw:parseDateBR_(dataRaw); if(!d) continue;
+      const baseDate=new Date(d.getFullYear(), d.getMonth(), 1); if(baseDate.getTime()>=mesCorrente) continue;
+      const valorApurar=Number(valorRaw)||0; if(valorApurar>0) add(sub+'|'+mesKey(baseDate), valorApurar);
+    }
+  }
+
+  // agrega por subcategoria e projeta (median/mean com winsor)
+  const agoraRef=new Date(hoje.getFullYear(), hoje.getMonth(), 1);
+  const subcats=new Set(Array.from(soma.keys()).map(k=>k.split('|')[0]));
+  const proj=[];
+  subcats.forEach(sub=>{
+    const valores=[];
+    for(let back=1; back<=24 && valores.length<12; back++){
+      const d=new Date(agoraRef.getFullYear(), agoraRef.getMonth()-back, 1);
+      const k=sub+'|'+mesKey(d);
+      if(soma.has(k)) valores.push(soma.get(k));
+    }
+    if(valores.length){
+      let estimativa;
+      if(metodo==='mean'){
+        estimativa = _r2(valores.reduce((a,b)=>a+b,0)/valores.length);
+      }else{
+        const v=valores.slice().sort((a,b)=>a-b), n=v.length;
+        const lo=v[Math.floor(0.025*(n-1))], hi=v[Math.ceil(0.975*(n-1))];
+        const clamp=v.map(x=>Math.min(Math.max(x,lo),hi));
+        const mid=Math.floor(clamp.length/2);
+        estimativa = clamp.length%2 ? clamp[mid] : _r2((clamp[mid-1]+clamp[mid])/2);
+        estimativa = _r2(estimativa);
+      }
+      proj.push([sub, estimativa]);
+    }
+  });
+
+  // ---------- Escrita idempotente ----------
+  const mesesHeaders = Array.from({length:nMeses}, (_,i)=>{
+    const d=new Date(hoje.getFullYear(), hoje.getMonth()+i+1, 1);
+    return Utilities.formatDate(d, _tz_(), "MM/yyyy");
+  });
+  const sh = _safeEnsureSheet_('Projeções', ['Projecoes']);
+
+  const header = ['Subcategoria', `Previsão Mensal (${metodo})`, ...mesesHeaders];
+  const nCols  = header.length;
+  const linhas = proj.map(([sub, est]) => [sub, est, ...Array(nMeses).fill(est)]);
+  const nRows  = Math.max(0, linhas.length);
+
+  sh.getRange(1,1,1,nCols).setValues([header]);
+
+  const prevLastRow = sh.getLastRow(), prevLastCol = sh.getLastColumn();
+  if (nRows) sh.getRange(2,1,nRows,nCols).setValues(linhas);
+  if (prevLastRow > nRows + 1) sh.getRange(nRows+2, 1, prevLastRow - (nRows+1), Math.max(nCols,1)).clearContent();
+  if (prevLastCol > nCols)     sh.getRange(1, nCols+1, Math.max(1, prevLastRow), prevLastCol - nCols).clearContent();
+
+  try{
+    sh.getRange(1,1,1,nCols).setFontWeight('bold').setHorizontalAlignment('left');
+    sh.setFrozenRows(1);
+    for (let c=2; c<=nCols; c++){
+      sh.getRange(2,c,Math.max(1, Math.max(sh.getLastRow()-1,1)),1).setNumberFormat('R$ #,##0.00');
+    }
+    try{ sh.setColumnWidth(1,260); for(let c=2;c<=nCols;c++) sh.setColumnWidth(c,140); }catch(_){}
+  }catch(_){}
+
+  _maybeToast_('📈 Projeções atualizadas ('+proj.length+' itens).');
+}
+
+function preverProximos3_(){ try{ preverProximosMeses_(3,'median'); }catch(e){ _maybeToast_('⚠️ Erro: '+(e&&e.message?e.message:e)); } }
+function preverProximos6_(){ try{ preverProximosMeses_(6,'median'); }catch(e){ _maybeToast_('⚠️ Erro: '+(e&&e.message?e.message:e)); } }
+function preverProximos12_(){ try{ preverProximosMeses_(12,'median'); }catch(e){ _maybeToast_('⚠️ Erro: '+(e&&e.message?e.message:e)); } }
+
+/* ===================== AUDITORIAS ===================== */
+
+function auditarDuplicados_(){ try{
+  const sh=_getLanc_(); if(!sh) return;
+  const last=sh.getLastRow(); if(last<4) return;
+  const ids=sh.getRange(4, COL.ID_EXTRATO, last-3,1).getValues().flat(); const mapa=new Map();
+  ids.forEach((id,i)=>{ if(!id) return; const row=i+4; const arr=mapa.get(id)||[]; arr.push(row); mapa.set(id,arr); });
+  const rngAll=sh.getRange(4, COL.ID_EXTRATO, last-3,1); rngAll.setBackground(null).clearNote();
+  mapa.forEach((linhas)=>{ if(linhas.length<=1) return; linhas.forEach(r=>{ const cell=sh.getRange(r, COL.ID_EXTRATO); cell.setBackground('#FFF3CD').setNote('Possível duplicado. Também em: '+linhas.join(', ')); }); });
+}catch(e){ Logger.log('auditarDuplicados_ fast error: '+e); }}
+
+function validarCartoes_(){
+  const cfg=_getCfg_(); if(!cfg) return;
+  const rows=_rangeCartoes_(cfg);
+  const problemasCiclo=[], semLimite=[];
+  rows.forEach(r=>{
+    const nome=String(r[0]||"").trim();
+    const venc=_sanitizaDia_(r[1]), ini=_sanitizaDia_(r[2]), fim=_sanitizaDia_(r[3]), lim=Number(r[4]||0);
+    if(!nome) return;
+    if(venc==null||ini==null||fim==null) problemasCiclo.push(`${nome}: ciclo inválido (início/fim/venc)`);
+    if(!(lim>0)) semLimite.push(nome);
+  });
+
+  if(problemasCiclo.length){
+    const max=12;
+    const body=problemasCiclo.slice(0,max).join('\n')+(problemasCiclo.length>max?`\n+${problemasCiclo.length-max}…`:``);
+    SpreadsheetApp.getUi().alert('Cartões com configuração inconsistente:\n'+body);
+  } else {
+    _maybeToast_('✔ Ciclos válidos.');
+  }
+
+  if(semLimite.length){
+    const max=8;
+    const msg = semLimite.length<=max ? semLimite.join(', ') : (semLimite.slice(0,max).join(', ') + ` +${semLimite.length-max}`);
+    _maybeToast_('ℹ️ Cartões sem limite definido: ' + msg);
+  }
+}
+
+function _alertarErrosResumo_(){
+  const shFat=_ensureFaturasHeaders_(), shRes=_ensureResumoHeaders_(), ui=SpreadsheetApp.getUi(), tz=_tz_();
+  if(!shFat||!shRes){ ui.alert('Auditoria', '❌ Abas "Faturas de Cartão" e/ou "Resumo de Faturas" não encontradas.', ui.ButtonSet.OK); return; }
+
+  // Faturas -> esperado (líquido/pagos) por CHAVE
+  const lastF=shFat.getLastRow(), fatRows=(lastF>=2)? shFat.getRange(2,1,lastF-1,11).getValues() : [], esperado=new Map();
+  function addExp(key, liquido, pagos){ if(!esperado.has(key)) esperado.set(key,{liquido:0,pagos:0}); const o=esperado.get(key); o.liquido+=liquido; o.pagos+=pagos; }
+  for(const r of fatRows){
+    const cartao=String(r[0]||"").trim();
+    const mesVal=r[1];
+    const mesDate=(mesVal instanceof Date&&!isNaN(mesVal))? new Date(mesVal.getFullYear(), mesVal.getMonth(), 1):null;
+    const mesStr = mesDate
+      ? Utilities.formatDate(mesDate, tz, "MM/yyyy")
+      : String(mesVal||"").trim();
+    const total=Number(r[3]||0), pagos=Number(r[7]||0), encargos=Number(r[8]||0), creditos=Number(r[9]||0);
+    if(!(cartao&&mesStr)) continue;
+    const key=`${_cardKeyFromName_(cartao)}||${mesStr}`;
+    const liquido=_r2(total+encargos-creditos);
+    addExp(key, liquido, Math.max(0,pagos));
+  }
+
+  // Resumo -> atual por CHAVE
+  const lastR=shRes.getLastRow(), resRows=(lastR>=2)? shRes.getRange(2,1,lastR-1,9).getValues() : [], atual=new Map();
+  for(const r of resRows){
+    const cartao=String(r[0]||"").trim();
+       const mesVal=r[1];
+    const mesDate=(mesVal instanceof Date&&!isNaN(mesVal))? new Date(mesVal.getFullYear(), mesVal.getMonth(), 1):null;
+    const mesStr = mesDate
+      ? Utilities.formatDate(mesDate, tz, "MM/yyyy")
+      : "";
+    const liquido=Number(r[2]||0), pend=Number(r[3]||0), conc=Number(r[4]||0), keyCol=String(r[6]||"").trim();
+    let key=keyCol;
+    if(!key){
+      if(!cartao||!mesStr) continue;
+      key=`${_cardKeyFromName_(cartao)}||${mesStr}`;
+    }
+    atual.set(key, { liquido:_r2(liquido), pend:_r2(pend), conc:_r2(conc) });
+  }
+
+  // Diferenças
+  const diffs=[], faltantes=[], sobrando=[];
+  function fmt(key){ const [cardHash, mes]=key.split('||'); return `${cardHash} — ${mes}`; }
+  function neq(a,b){ return Math.abs((Number(a)||0)-(Number(b)||0))>=EPS_CENT; }
+
+  for(const [key, exp] of esperado.entries()){
+    if(!atual.has(key)){ faltantes.push(`+ Faltando no Resumo: ${fmt(key)} (líquido R$ ${exp.liquido.toFixed(2)})`); continue; }
+    const cur=atual.get(key), campos=[];
+    if(neq(exp.liquido,cur.liquido)) campos.push(`Líquido exp=${exp.liquido.toFixed(2)} ≠ cur=${cur.liquido.toFixed(2)}`);
+    const pendExp=_r2(Math.max(exp.liquido-exp.pagos,0)), concExp=_r2(Math.min(exp.pagos,exp.liquido));
+    if(neq(pendExp,cur.pend)) campos.push(`Pend exp=${pendExp.toFixed(2)} ≠ cur=${cur.pend.toFixed(2)}`);
+    if(neq(concExp,cur.conc)) campos.push(`Conc exp=${concExp.toFixed(2)} ≠ cur=${cur.conc.toFixed(2)}`);
+    if(campos.length) diffs.push(`• ${fmt(key)} → ${campos.join(' | ')}`);
+  }
+  for(const key of atual.keys()){ if(!esperado.has(key)) sobrando.push(`- Sobrando no Resumo: ${fmt(key)}`); }
+
+  if(!diffs.length && !faltantes.length && !sobrando.length){
+    SpreadsheetApp.getUi().alert('Auditoria', '✅ Resumo compatível com Faturas (pagto parcial).', SpreadsheetApp.getUi().ButtonSet.OK);
+    return;
+  }
+  const cap=35, seg=(arr,t)=>arr.length?`\n${t}\n`+arr.slice(0,cap).join('\n')+(arr.length>cap?`\n... (+${arr.length-cap})`:``):'';
+  const msg= seg(diffs,'Diferenças') + seg(faltantes,'Faltando no Resumo') + seg(sobrando,'Sobrando no Resumo');
+  SpreadsheetApp.getUi().alert('Auditoria — Faturas × Resumo', msg.trim()||'Inconsistências detectadas.', SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+function auditarGeralParte2_(){
+  const ui = SpreadsheetApp.getUi();
+  const tz = _tz_();
+  const cfg = _getCfg_();
+  const lanc = _getLanc_();
+  const shFat = _ensureFaturasHeaders_();
+  const shRes = _ensureResumoHeaders_();
+
+  const linhas = [];
+
+  // 1) Cartões
+  try{
+    const rows = _rangeCartoes_(cfg);
+    const problemas=[], semLimite=[], duplicatas=[];
+    const seen=new Set();
+    rows.forEach(r=>{
+      const nome=String(r[0]||"").trim();
+      if(!nome) return;
+      const k=_normLower_(_stripDiacritics_(nome));
+      if(seen.has(k)) duplicatas.push(nome); else seen.add(k);
+
+      const venc=_sanitizaDia_(r[1]), ini=_sanitizaDia_(r[2]), fim=_sanitizaDia_(r[3]), lim=Number(r[4]||0);
+      if(venc==null||ini==null||fim==null) problemas.push(`${nome}: ciclo inválido (início/fim/venc)`);
+      if(!(lim>0)) semLimite.push(nome);
+    });
+    if(problemas.length) linhas.push('• Cartões com ciclo inválido: '+(problemas.length<=6?problemas.join('; '): (problemas.slice(0,6).join('; ')+' …')));
+    if(semLimite.length) linhas.push('• Cartões sem limite: '+(semLimite.length<=8?semLimite.join('; '):(semLimite.slice(0,8).join('; ')+' …')));
+    if(duplicatas.length) linhas.push('• Cartões duplicados (nome): '+(duplicatas.length<=8?duplicatas.join('; '):(duplicatas.slice(0,8).join('; ')+' …')));
+  }catch(_){}
+
+  // 2) Faturas
+  try{
+    const last=shFat.getLastRow();
+    const rows=(last>=2)? shFat.getRange(2,1,last-1,11).getValues():[];
+    const keys=[], negCols=[], overPays=[];
+    const map=new Map();
+    rows.forEach(r=>{
+      const cartao=String(r[0]||"").trim();
+      const mesVal=r[1];
+      const mesDate=(mesVal instanceof Date&&!isNaN(mesVal))? new Date(mesVal.getFullYear(), mesVal.getMonth(), 1):null;
+      const mesStr = mesDate
+        ? Utilities.formatDate(mesDate, tz, "MM/yyyy")
+        : String(mesVal||"").trim();
+      const val = Number(r[3]||0);
+      const pago= Math.max(0, Number(r[7]||0));
+      const enc = Math.max(0, Number(r[8]||0));
+      const cred= Math.max(0, Number(r[9]||0));
+      const chave=String(r[6]||"").trim() || (cartao&&mesStr ? `${_cardKeyFromName_(cartao)}||${mesStr}` : '');
+
+      if(!chave) keys.push('(linha sem cartão/mês)');
+      else map.set(chave, (map.get(chave)||0)+1);
+
+      if(Number(r[7]||0) < 0 || Number(r[8]||0) < 0 || Number(r[9]||0) < 0){
+        negCols.push(chave||'(sem chave)');
+      }
+      const liquido = _r2(val + enc - cred);
+      if(pago > liquido + EPS_CENT) overPays.push(`${chave||'(sem chave)'} pago>${liquido.toFixed(2)}`);
+    });
+    const dups = Array.from(map.entries()).filter(([,n])=>n>1).map(([k])=>k);
+    if(keys.length) linhas.push(`• Faturas sem CHAVE: ${keys.length}`);
+    if(dups.length) linhas.push(`• Faturas com CHAVE duplicada: ${dups.length}`);
+    if(negCols.length) linhas.push(`• Faturas com valores negativos em Pago/Encargos/Créditos: ${negCols.length}`);
+    if(overPays.length) linhas.push(`• Faturas com pagamento acima do líquido: ${overPays.length}`);
+  }catch(_){}
+
+  // 3) Resumo
+  try{
+    const lastR=shRes.getLastRow();
+    const rowsR=(lastR>=2)? shRes.getRange(2,1,lastR-1,9).getValues():[];
+    const keysR=[], dupsR=[];
+    const m=new Map();
+    rowsR.forEach(r=>{
+      const chave=String(r[6]||"").trim();
+      if(!chave) keysR.push('(linha sem chave)');
+      else m.set(chave,(m.get(chave)||0)+1);
+    });
+    dupsR.push(...Array.from(m.entries()).filter(([,n])=>n>1).map(([k])=>k));
+    if(keysR.length) linhas.push(`• Resumo sem CHAVE: ${keysR.length}`);
+    if(dupsR.length) linhas.push(`• Resumo com CHAVE duplicada: ${dupsR.length}`);
+
+    // Divergências Resumo × Faturas
+    const tz2=_tz_();
+    const lastF=shFat.getLastRow();
+    const fatRows=(lastF>=2)? shFat.getRange(2,1,lastF-1,11).getValues():[];
+    const esperado=new Map();
+    function addExp(key, liquido, pagos){ if(!esperado.has(key)) esperado.set(key,{liquido:0,pagos:0}); const o=esperado.get(key); o.liquido+=liquido; o.pagos+=pagos; }
+    for(const r of fatRows){
+      const cartao=String(r[0]||"").trim();
+      const mesVal=r[1];
+      const mesDate=(mesVal instanceof Date&&!isNaN(mesVal))? new Date(mesVal.getFullYear(), mesVal.getMonth(), 1):null;
+      const mesStr = mesDate
+        ? Utilities.formatDate(mesDate, tz2, "MM/yyyy")
+        : String(mesVal||"").trim();
+      const total=Number(r[3]||0), pagos=Number(r[7]||0), encargos=Number(r[8]||0), creditos=Number(r[9]||0);
+      if(!(cartao&&mesStr)) continue;
+      const key=`${_cardKeyFromName_(cartao)}||${mesStr}`;
+      const liquido=_r2(total+encargos-creditos);
+      addExp(key, liquido, Math.max(0,pagos));
+    }
+    const atual=new Map();
+    rowsR.forEach(r=>{
+      const cartao=String(r[0]||"").trim();
+      const mesVal=r[1];
+      const mesDate=(mesVal instanceof Date&&!isNaN(mesVal))? new Date(mesVal.getFullYear(), mesVal.getMonth(), 1):null;
+      const mesStr = mesDate
+        ? Utilities.formatDate(mesDate, tz2, "MM/yyyy")
+        : "";
+      const liquido=Number(r[2]||0), pend=Number(r[3]||0), conc=Number(r[4]||0), keyCol=String(r[6]||"").trim();
+      let key=keyCol; if(!key){ if(!cartao||!mesStr) return; key=`${_cardKeyFromName_(cartao)}||${mesStr}`; }
+      atual.set(key, { liquido:_r2(liquido), pend:_r2(pend), conc:_r2(conc), cartao });
+    });
+    let diffs=0, falt=0, sob=0;
+    function neq(a,b){ return Math.abs((Number(a)||0)-(Number(b)||0))>=EPS_CENT; }
+    for(const [key, exp] of esperado.entries()){
+      if(!atual.has(key)){ falt++; continue; }
+      const cur=atual.get(key);
+      const pendExp=_r2(Math.max(exp.liquido-exp.pagos,0)), concExp=_r2(Math.min(exp.pagos,exp.liquido));
+      if(neq(exp.liquido,cur.liquido) || neq(pendExp,cur.pend) || neq(concExp,cur.conc)) diffs++;
+    }
+    for(const key of atual.keys()){ if(!esperado.has(key)) sob++; }
+    if(diffs||falt||sob) linhas.push(`• Resumo × Faturas: ${diffs} diferenças, ${falt} faltando, ${sob} sobrando`);
+
+    // Utilização e Exposição
+    const limites=_limitePorCartao_(cfg);
+    const expoFutura=_exposicaoFuturaPorCartao_(lanc, cfg);
+    let utilDiff=0, expoDiff=0;
+    rowsR.forEach(r=>{
+      const cartao=String(r[0]||"").trim(); if(!cartao) return;
+      const liq=Number(r[2]||0);
+      const utilCell=r[7]; // %
+      const lim = Number(limites.get(cartao)||0);
+      const utilEsperada = lim>0 ? liq/lim : '';
+      const utilOk = (utilEsperada==='' && (utilCell===''||utilCell==null)) || (typeof utilEsperada==='number' && Math.abs(utilEsperada - Number(utilCell||0))<=0.005);
+      if(!utilOk) utilDiff++;
+
+      const expoCell=Number(r[8]||0);
+      const expoEsperada=Number(expoFutura.get(cartao)||0);
+      if(Math.abs(expoEsperada - expoCell) > 0.01) expoDiff++;
+    });
+    if(utilDiff) linhas.push(`• Resumo: Utilização (%) divergente em ${utilDiff} linha(s)`);
+    if(expoDiff) linhas.push(`• Resumo: Exposição futura divergente em ${expoDiff} linha(s)`);
+  }catch(_){}
+
+  if(!linhas.length){
+    ui.alert('Auditoria Geral (Parte 2)', '✅ Nenhuma inconsistência relevante encontrada.', ui.ButtonSet.OK);
+  } else {
+    const msg = 'Foram encontradas as seguintes pendências:\n\n- ' + linhas.join('\n- ');
+    ui.alert('Auditoria Geral (Parte 2)', msg, ui.ButtonSet.OK);
+  }
+}
+
+/** Gera lançamentos de demonstração (até 300 linhas) na aba Lançamento de Despesa. */
+function gerar300LancamentosDemo_(qtd){
+  qtd = Math.max(1, Math.min(Number(qtd)||300, 300));
+  const sh = _getLanc_(), cfg = _getCfg_();
+  if(!sh){ _maybeToast_('❌ Aba "Lançamento de Despesa" não encontrada.'); return; }
+
+  // Garante que a DV da Forma está alinhada com Config (H + cartões)
+  try{ corrigirDVFormaAgora_(); }catch(_){}
+
+  const tz   = _tz_();
+  const hoje = _today_();
+
+  // Listas (com fallbacks)
+  const cfgLists  = getCfgCached_(cfg) || {};
+  const subs      = (cfgLists.subs && cfgLists.subs.length ? cfgLists.subs
+                    : ['Mercado','Transporte','Saúde','Lazer','Restaurante','Serviços','Outros']);
+  const subToCat  = cfgLists.subToCat || {};
+
+  // Detalhamentos por Subcategoria
+  let detPorSub = cfgLists.detPorSub;
+  if (!detPorSub){
+    detPorSub = {};
+    try{
+      const lastCfg = _cfgLastRow_(cfg);
+      if (lastCfg && lastCfg >= 3){
+        const detVals = cfg.getRange(3,5, lastCfg-2, 1).getValues().flat(); // E
+        const subVals = cfg.getRange(3,6, lastCfg-2, 1).getValues().flat(); // F
+        for (let i=0;i<detVals.length;i++){
+          const det = String(detVals[i]||'').trim();
+          const sub = String(subVals[i]||'').trim();
+          if (det && sub){
+            if (!detPorSub[sub]) detPorSub[sub] = [];
+            detPorSub[sub].push(det);
+          }
+        }
+      }
+    }catch(_){}
+  }
+
+  // Formas de pagamento válidas
+  let formasOK  = listaFormasComCartoes_(cfg) || [];
+  if (!formasOK.length) formasOK = ['Pix','Débito','Dinheiro','Boleto'];
+
+  // Helpers
+  function rand(a,b){ return a + Math.random()*(b-a); }
+  function pick(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
+  function randDateUltimosDias(maxDias){
+    const d = new Date(hoje);
+    d.setDate(d.getDate() - Math.floor(rand(0, maxDias)));
+    return d;
+  }
+  function fmtComp(d){ return Utilities.formatDate(new Date(d.getFullYear(), d.getMonth(), 1), tz, 'MM/yyyy'); }
+
+  const startRow      = Math.max(4, sh.getLastRow()+1);
+  const rows          = [];
+  const mesesAfetados = new Set();
+
+  for(let i=0;i<qtd;i++){
+    const d   = randDateUltimosDias(180);
+    const sub = pick(subs);
+    const cat = subToCat[sub] || 'Outros';
+
+    let detalhamento = '';
+    const detLista = detPorSub && detPorSub[sub];
+    if (detLista && detLista.length) detalhamento = pick(detLista);
+
+    const forma      = pick(formasOK);
+    const usarCartao = ehCartao_(forma);
+
+    let parcelas = 1;
+    if (usarCartao && Math.random() < 0.35){
+      parcelas = pick([2,3,4,6,8,10,12]);
+    }
+
+    let valor;
+    if (/mercad|restaur|lazer|saud|transp|serv/i.test(sub)) {
+      valor = _r2(rand(25, 600));
+    } else {
+      valor = _r2(rand(15, 1200));
+    }
+
+    const diasAteHoje = Math.floor((hoje - _dateOnly_(d))/(24*3600*1000));
+    let status = '';
+    let liquidacao = '';
+    if (diasAteHoje > 45){
+      status = 'Conciliado';
+      liquidacao = d;
+    } else if (diasAteHoje > 10){
+      status = pick(['Pendente','Conciliado']);
+      liquidacao = (status.match(/conciliado/i) ? d : '');
+    } else {
+      status = 'Pendente';
+      liquidacao = '';
+    }
+
+    const comp = fmtComp(d);
+    mesesAfetados.add(d.getMonth()+1);
+
+    const idExtr = `DEMO-${Utilities.getUuid().slice(0,8)}-${(i+1)}`;
+
+    const row = [];
+    row[COL.DATA - COL.DATA]            = d;
+    row[COL.SUBCATEGORIA - COL.DATA]    = sub;
+    row[COL.DETALHAMENTO - COL.DATA]    = detalhamento;
+    row[COL.CATEGORIA - COL.DATA]       = cat;
+    row[COL.FORMA - COL.DATA]           = forma;
+    row[COL.PARCELAS - COL.DATA]        = parcelas;
+    row[COL.VALOR - COL.DATA]           = valor;
+    row[COL.VALOR_PARCELADO - COL.DATA] = '';
+    row[COL.STATUS - COL.DATA]          = status;
+    row[COL.COMPETENCIA - COL.DATA]     = comp;
+    row[COL.CENTRO_CUSTO - COL.DATA]    = '';
+    row[COL.TIPO - COL.DATA]            = '';
+    row[COL.LIQUIDACAO - COL.DATA]      = liquidacao;
+    row[COL.ID_EXTRATO - COL.DATA]      = idExtr;
+    row[COL2.COMP_CONSUMO - COL.DATA]   = comp;
+    row[COL_FP - COL.DATA]              = '';
+
+    rows.push(row);
+  }
+
+  // Grava em bloco
+  sh.getRange(startRow, COL.DATA, rows.length, (COL_FP - COL.DATA + 1)).setValues(rows);
+
+  // Formatos
+  try{
+    sh.getRange(startRow, COL.DATA, rows.length, 1).setNumberFormat('dd/MM/yyyy');
+    sh.getRange(startRow, COL.VALOR, rows.length, 1).setNumberFormat('R$ #,##0.00');
+    sh.getRange(startRow, COL.VALOR_PARCELADO, rows.length, 1).setNumberFormat('R$ #,##0.00');
+    sh.getRange(startRow, COL.COMPETENCIA, rows.length, 1).setNumberFormat('MM/yyyy');
+    sh.getRange(startRow, COL2.COMP_CONSUMO, rows.length, 1).setNumberFormat('MM/yyyy');
+    sh.getRange(startRow, COL.LIQUIDACAO, rows.length, 1).setNumberFormat('dd/MM/yyyy');
+  }catch(_){}
+
+  try{ if (typeof pendMarcarMeses_ === 'function') pendMarcarMeses_([...mesesAfetados]); }catch(_){}
+  try{ if (typeof pendMarcarPrevisao_ === 'function') pendMarcarPrevisao_(); }catch(_){}
+  try{ if (typeof pendMarcarFaturasResumo_ === 'function') pendMarcarFaturasResumo_(); }catch(_){}
+
+  _maybeToast_(`✅ Inseridos ${rows.length} lançamentos demo; Detalhamento só quando existir para a Subcategoria. Recalcule para atualizar resumos/indicadores.`);
+}
